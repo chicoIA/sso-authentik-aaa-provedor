@@ -1,0 +1,12 @@
+#!/bin/sh
+# SNMP extend: estado da sincronização das listas de equipamentos do TACACS+
+# (provedor-tacacs-conjuntos, roda na VM a cada minuto e grava este arquivo na VPS).
+# Fonte: apps/vps/reserva/.
+#   provedor-tacacs-conjuntos-snmp codigo -> 0 ok, 1 aviso (item ignorado / VPS atrasada),
+#                                           2 erro (lista não atualizada), 9 sem notícia > 5 min
+#   provedor-tacacs-conjuntos-snmp texto  -> descrição
+A=/var/lib/provedor-tacacs/conjuntos.estado
+if [ -r "$A" ]; then read -r cod ts txt < "$A"; else cod=""; fi
+agora=$(date +%s)
+if [ -z "$cod" ] || [ $((agora - ${ts:-0})) -gt 300 ]; then cod=9; txt="sincronização das listas do TACACS+ parada (VM sem falar com a VPS?)"; fi
+case "${1:-codigo}" in texto) echo "$txt" ;; *) echo "$cod" ;; esac

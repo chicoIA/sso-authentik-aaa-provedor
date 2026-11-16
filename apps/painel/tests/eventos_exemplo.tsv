@@ -1,0 +1,10 @@
+2026-10-12T08:00:01-03:00	authen	100.65.20.10	alice	tty0	198.51.100.5	permitido	perfil=tacacs-admin priv-lvl=15
+2026-10-12T08:00:05-03:00	author	100.65.20.10	alice	tty0	198.51.100.5	permitido	cmd=show ip route
+2026-10-12T08:00:09-03:00	author	100.65.20.10	alice	tty0	198.51.100.5	negado	cmd=reload
+2026-10-12T08:00:10-03:00	acct	100.65.20.10	alice	tty0	198.51.100.5	start	service=shell
+2026-10-12T08:05:10-03:00	acct	100.65.20.10	alice	tty0	198.51.100.5	stop	service=shell
+2026-10-12T08:10:00-03:00	authen	100.66.27.20	bob	vty1	198.51.100.9	negado	senha incorreta
+2026-10-12T08:11:00-03:00	authen	100.66.27.20	bob	vty1	198.51.100.9	permitido	perfil=tacacs-leitura priv-lvl=1
+2026-10-12T08:11:10-03:00	author	100.66.27.20	bob	vty1	198.51.100.9	permitido	cmd=display version
+2026-10-12T08:11:12-03:00	acct	100.66.27.20	bob	vty1	198.51.100.9	start	service=shell
+2026-10-12T08:12:00-03:00	author	100.66.27.20	bob	vty1	198.51.100.9	permitido	cmd==cmd|calc injecao <b>html</b>

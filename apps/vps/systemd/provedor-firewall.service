@@ -1,0 +1,15 @@
+[Unit]
+Description=Firewall de entrada Exemplo (tabela inet provedor)
+Wants=network-pre.target
+Before=network-pre.target
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/provedor.nft
+ExecStop=/usr/sbin/nft delete table inet provedor
+
+[Install]
+WantedBy=multi-user.target

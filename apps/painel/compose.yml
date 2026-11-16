@@ -1,0 +1,36 @@
+# App painel: painel web do TACACS+ (Flask + SQLite) com login OIDC no authentik.
+# Requer a rede "provedor" e o volume "provedor-tacacs-logs" (criado pelo app tacacs).
+# Não suba direto: use ./provedor up painel
+services:
+  painel:
+    build: .
+    image: provedor-painel:local
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      PAINEL_URL_EXTERNA: ${PAINEL_URL_EXTERNA:-http://100.66.80.196:9049}
+      AUTHENTIK_URL_EXTERNA: ${AUTHENTIK_URL_EXTERNA:-https://100.66.80.196:9443}
+      PAINEL_AUTHENTIK_INTERNO: ${PAINEL_AUTHENTIK_INTERNO:-}
+      PAINEL_OIDC_SECRET: ${PAINEL_OIDC_SECRET:?preencha PAINEL_OIDC_SECRET no .env}
+      PAINEL_SECRET_KEY: ${PAINEL_SECRET_KEY:?preencha PAINEL_SECRET_KEY no .env}
+      PAINEL_OIDC_VERIFICAR_TLS: ${PAINEL_OIDC_VERIFICAR_TLS:-0}
+      PAINEL_RETENCAO_DIAS: ${PAINEL_RETENCAO_DIAS:-365}
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      - "9049:9049"
+    volumes:
+      - provedor-tacacs-logs:/var/log/tacacs:ro
+      - painel-dados:/dados
+    networks:
+      - provedor
+
+networks:
+  provedor:
+    external: true
+    name: provedor
+
+volumes:
+  provedor-tacacs-logs:
+    external: true
+    name: provedor-tacacs-logs
+  painel-dados:

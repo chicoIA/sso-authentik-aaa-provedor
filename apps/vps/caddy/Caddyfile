@@ -1,0 +1,45 @@
+# Caddyfile da VPS: fica em /opt/proxy/Caddyfile, montado no container proxy-caddy-1
+# (apps/vps/caddy/compose.yml). Os scripts provedor-geoip-br e provedor-reserva
+# contam com esses caminhos e com o volume proxy_caddy_data.
+{
+    # e-mail da conta ACME (avisos de certificado)
+    email noc@exemplo.net.br
+}
+
+(security_headers) {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+}
+
+# Site do SSO: importado pelo Caddyfile da VPS (apps/vps/caddy/Caddyfile).
+# Para editar em produção: valide antes de recarregar:
+#   docker exec proxy-caddy-1 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && \
+#   docker exec proxy-caddy-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+# Certificado: Let's Encrypt automático (o DNS do nome precisa apontar para a VPS).
+sso.exemplo.net.br {
+    import security_headers
+    log
+    # Só Brasil (lista LACNIC gerada por /usr/local/sbin/provedor-geoip-br, timer semanal).
+    import /data/provedor/brasil.caddy
+    respond @fora_do_brasil "Acesso permitido somente a partir do Brasil." 403
+    # Documentação/esquema da API (versão exata e mapa da API) só da rede interna
+    # e dos prefixos do seu AS; as chamadas usadas pelo login continuam liberadas.
+    @doc_api {
+        path /api/v3 /api/v3/ /api/v3/schema /api/v3/schema/*
+        not remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.51.100.0/24 192.0.2.0/24 2001:db8::/32
+    }
+    respond @doc_api 404
+    # authentik ativo (VM principal) pelo túnel WireGuard/BGP. Upstream em HTTPS
+    # (9443): assim o authentik sabe que o acesso é https mesmo quando não
+    # confia no X-Forwarded-Proto e
+    # não gera URLs http:// (o navegador bloquearia: "null"/"interceptors").
+    # Certificado do authentik é o autoassinado padrão; o trecho já é interno
+    # e cifrado pelo WireGuard, por isso não validamos.
+    # Destino do sso.: VM (normal) ou authentik da reserva. O arquivo é
+    # trocado por provedor-reserva ativa/volta.
+    import /data/provedor/sso-destino.caddy
+}

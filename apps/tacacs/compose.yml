@@ -1,0 +1,53 @@
+# App tacacs: TACACS+ (tac_plus-ng) autenticando e autorizando pelo LDAP do authentik.
+# PREVISTO para depois da migração: não sobe junto com os demais.
+# Suba com: ./provedor up tacacs
+# Requer os apps authentik e ldap no ar, a rede "provedor" e o volume "provedor-tacacs-logs".
+services:
+  tacacs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: provedor-tacacs:local
+    init: true
+    restart: unless-stopped
+    mem_limit: 192m  # 96m não aguenta força bruta de SSH (docs/ssh-acl.md)
+    environment:
+      TACACS_KEY: ${TACACS_KEY:?preencha TACACS_KEY no .env}
+      LDAP_SERVICO_SENHA: ${LDAP_SERVICO_SENHA:?preencha LDAP_SERVICO_SENHA no .env}
+      TACACS_LDAP_BASE_DN: ${AUTHENTIK_LDAP_BASE_DN:-dc=ldap,dc=provedor,dc=com,dc=br}
+      TACACS_LDAP_URL: ${TACACS_LDAP_URL:-ldap://ldap-outpost:3389}
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      # Porta publicada no host (não é network_mode host); o daemon escuta 4949 no container.
+      - "49:4949"
+    volumes:
+      # Contrato com o painel: /var/log/tacacs/eventos.tsv (o painel monta só leitura).
+      - provedor-tacacs-logs:/var/log/tacacs
+      # Conjuntos de equipamentos gerados pelo provedor-tacacs-conjuntos (só leitura).
+      - /etc/provedor-tacacs:/etc/tacacs/conjuntos:ro
+    tmpfs:
+      # Configuração gerada com a chave: só em memória.
+      - /run/tacacs:mode=0755
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:            # o entrypoint ajusta o volume e depois larga para o usuário "tacacs"
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - provedor
+
+volumes:
+  provedor-tacacs-logs:
+    external: true
+    name: provedor-tacacs-logs
+
+networks:
+  provedor:
+    external: true
+    name: provedor

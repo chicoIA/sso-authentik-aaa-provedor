@@ -1,0 +1,10 @@
+[Unit]
+Description=Exemplo: retenção do radacct/radpostauth (apps/banco)
+After=mariadb.service
+Requires=mariadb.service
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/opt/authentik-aaa-provedor/apps/banco/banco.sh retencao --executar

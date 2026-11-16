@@ -1,0 +1,14 @@
+#  EAP mínimo, só para o modo legado (FR_CHAP_LEGADO=sim): EAP-MD5 pelo SQL do
+#  daloRADIUS, como o FreeRADIUS antigo faria. Sem TLS/PEAP/TTLS (não há
+#  inner-tunnel nem certificados nesta imagem). Com FR_CHAP_LEGADO=nao o EAP
+#  é recusado antes de chegar aqui.
+eap {
+	default_eap_type = md5
+	timer_expire = 60
+	ignore_unknown_eap_types = no
+	cisco_accounting_username_bug = no
+	max_sessions = ${max_requests}
+
+	md5 {
+	}
+}

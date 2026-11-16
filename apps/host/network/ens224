@@ -1,0 +1,6 @@
+# /etc/network/interfaces.d/ens224 da VM Radius. Fonte: apps/host/.
+# A rota padrão NÃO fica aqui: vem do FRR (BGP do S12700, reserva estática pelo
+# .193), com origem no .196. Ver apps/host/frr/frr.conf.
+auto ens224
+iface ens224 inet static
+	address 172.16.7.10/30

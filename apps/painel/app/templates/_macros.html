@@ -1,0 +1,14 @@
+{% macro res(r) %}{% if r in ('permitido','start') %}<span class="ok">{{ r }}</span>{% elif r=='negado' %}<span class="err">{{ r }}</span>{% else %}<span class="wr">{{ r }}</span>{% endif %}{% endmacro %}
+{% macro tabela_eventos(linhas) %}
+<div class="tw"><table><tr><th>Data/hora</th><th>Tipo</th><th>Equipamento</th><th>Usuário</th><th>Porta</th><th>Origem</th><th>Resultado</th><th>Detalhe</th></tr>
+{% for e in linhas %}<tr><td>{{ e.ts|ts }}</td><td>{{ e.tipo }}</td>
+<td><a href="{{ url_for('pagina_equipamento', ip=e.nas_ip) }}">{{ e.nas_ip }}</a></td>
+<td>{% if e.usuario %}<a href="{{ url_for('pagina_usuario', nome=e.usuario) }}">{{ e.usuario }}</a>{% endif %}</td>
+<td>{{ e.porta }}</td><td>{{ e.origem }}</td><td>{{ res(e.resultado) }}</td><td class="cmd">{{ e.detalhe }}</td></tr>
+{% else %}<tr><td colspan="8" class="mut">Nenhum evento.</td></tr>{% endfor %}</table></div>
+{% endmacro %}
+{% macro paginacao(p, paginas, total, base, qs) %}
+<div class="pag"><span class="mut">{{ total }} registro(s) - página {{ p }} de {{ paginas }}</span>
+{% if p>1 %}<a href="{{ base }}?{{ qs }}&p={{ p-1 }}">&laquo; anterior</a>{% endif %}
+{% if p<paginas %}<a href="{{ base }}?{{ qs }}&p={{ p+1 }}">próxima &raquo;</a>{% endif %}</div>
+{% endmacro %}

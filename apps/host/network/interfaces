@@ -1,0 +1,19 @@
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# ens192: antiga placa do IP de serviço (antes do BGP), vlan do BORDA-A
+# (.193/26). Fica ligada SEM IP: a VM ainda responde ARP do .196 por ela se o /32
+# do BGP sumir (o /26 volta a entregar pelo MikroTik), e a reserva da rota padrão
+# do FRR sai por ela (onlink). Retirada só no fim da migração
+# para o BGP (docs/failover-vps.md).
+allow-hotplug ens192
+iface ens192 inet manual
+	up ip link set dev $IFACE up
+	dns-nameservers 198.51.100.53
+	dns-search exemplo.net.br

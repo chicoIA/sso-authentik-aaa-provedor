@@ -1,0 +1,228 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Acesso da equipe aos equipamentos de rede (substitui o daloRADIUS).
+#
+#   NAS (Mikrotik, OLT, switch...) -> FreeRADIUS (proxy + accounting) -> outpost RADIUS -> authentik
+#
+# Cria:
+#   - grupos de nível "radius-admin" e "radius-leitura": quem está num deles entra, com o
+#     nível do atributo radius_reply do grupo (os atributos são editados na tela,
+#     por isso state: created)
+#   - grupo "radius-equipamentos": acesso dos usuários migrados, sem nível; pode sair
+#     depois da transição
+#   - property mapping que devolve os atributos herdados do daloRADIUS
+#     (radreply/radgroupreply) gravados nos atributos dos grupos e usuários
+#   - provider + aplicação + outpost RADIUS
+#
+# O segredo compartilhado (FreeRADIUS <-> outpost) vem da variável
+# AUTHENTIK_RADIUS_SECRET do container worker (ver .env).
+# Depende do blueprint provedor/authentik/01-fluxo-autenticacao.yaml.
+version: 1
+metadata:
+  name: Exemplo - RADIUS equipamentos
+  labels:
+    blueprints.goauthentik.io/description: Provider RADIUS para acesso aos equipamentos
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        path: provedor/authentik/01-fluxo-autenticacao.yaml
+      required: true
+
+  # Grupo de acesso da migração: a ferramenta apps/migracao põe todo usuário migrado
+  # aqui. Dá acesso sem nível próprio (o nível vem dos grupos migrados do daloRADIUS).
+  - model: authentik_core.group
+    id: grupo-acesso
+    identifiers:
+      name: radius-equipamentos
+    attrs:
+      attributes:
+        descricao: Membros podem autenticar nos equipamentos de rede via RADIUS
+
+  - model: authentik_core.group
+    id: grupo-admin
+    state: created
+    identifiers:
+      name: radius-admin
+    attrs:
+      attributes:
+        descricao: RADIUS - admin nos equipamentos (Mikrotik full, Huawei 15)
+        radius_reply: ["Mikrotik-Group := full", "Service-Type := Administrative-User", "Huawei-Exec-Privilege = 15"]
+        radius_prioridade: 0
+
+  - model: authentik_core.group
+    id: grupo-leitura
+    state: created
+    identifiers:
+      name: radius-leitura
+    attrs:
+      attributes:
+        descricao: RADIUS - leitura nos equipamentos (Mikrotik read, Huawei 2)
+        radius_reply: ["Service-Type := Login-User", "Mikrotik-Group := read", "Huawei-Exec-Privilege = 2"]
+        radius_prioridade: 0
+
+  - model: authentik_providers_radius.radiusproviderpropertymapping
+    id: mapping-daloradius
+    identifiers:
+      name: "Exemplo: atributos RADIUS herdados do daloRADIUS"
+    attrs:
+      expression: |
+        # Monta a resposta RADIUS (Access-Accept) a partir dos atributos
+        # "radius_reply" dos grupos do usuário e do próprio usuário,
+        # reproduzindo o comportamento do rlm_sql do FreeRADIUS/daloRADIUS:
+        #   1) radreply do usuário   -> attributes.radius_reply do usuário
+        #   2) radgroupreply         -> attributes.radius_reply de cada grupo,
+        #      na ordem de attributes.radius_prioridade (menor primeiro)
+        # Cada item é uma linha no formato do daloRADIUS:
+        #   "Mikrotik-Group := full"
+        #   "Service-Type := Administrative-User"
+        #   "Cisco-AVPair += shell:priv-lvl=15"
+        # Operadores: ":=" substitui, "=" só adiciona se ainda não existe,
+        # "+=" acrescenta mais um valor. "==" (check item) é ignorado.
+        #
+        # Confirmado em authentik/providers/radius/api/providers.py (2026.8.3): variáveis
+        # da expressão = request (request.user) e packet; define_attribute() cadastra
+        # atributos de fabricante; o retorno é ignorado (o pacote é alterado direto).
+        # Atributos padrão (RFC) já existem no dicionário do authentik.
+        # Atributos de fabricante precisam estar na tabela abaixo; para
+        # adicionar um novo, copie o código do dicionário do FreeRADIUS
+        # (/usr/share/freeradius/dictionary.<fabricante>).
+        FABRICANTES = {
+            # nome no FreeRADIUS: (vendor id, vendor, atributo, código, tipo)
+            "Mikrotik-Group": (14988, "Mikrotik", "Group", 3, "string"),
+            "Huawei-Exec-Privilege": (2011, "Huawei", "Exec-Privilege", 29, "integer"),
+            "Cisco-AVPair": (9, "Cisco", "AVPair", 1, "string"),
+            "Juniper-Local-User-Name": (2636, "Juniper", "Local-User-Name", 1, "string"),
+            "Juniper-Allow-Commands": (2636, "Juniper", "Allow-Commands", 2, "string"),
+            "Juniper-Deny-Commands": (2636, "Juniper", "Deny-Commands", 3, "string"),
+            "Fortinet-Group-Name": (12356, "Fortinet", "Group-Name", 1, "string"),
+            "Fortinet-Vdom-Name": (12356, "Fortinet", "Vdom-Name", 3, "string"),
+            "Fortinet-Access-Profile": (12356, "Fortinet", "Access-Profile", 6, "string"),
+            "H3C-Exec-Privilege": (25506, "H3C", "Exec-Privilege", 29, "integer"),
+            "HP-Privilege-Level": (11, "HP", "Privilege-Level", 1, "integer"),
+            "HP-Command-String": (11, "HP", "Command-String", 2, "string"),
+            "ZTE-SW-Privilege": (3902, "ZTE", "SW-Privilege", 104, "integer"),
+            "Timetra-Profile": (6527, "Timetra", "Profile", 4, "string"),
+            "Ruckus-User-Groups": (25053, "Ruckus", "User-Groups", 1, "string"),
+            "Brocade-Auth-Role": (1588, "Brocade", "Auth-Role", 1, "string"),
+        }
+        INTEIROS = ("integer", "short", "byte", "signed", "integer64")
+
+        def ler_linha(linha):
+            partes = str(linha).strip().split(None, 2)
+            if len(partes) != 3 or partes[1] not in (":=", "=", "+=", "=="):
+                ak_logger.warning("radius: linha ignorada", linha=linha)
+                return None
+            nome, op, valor = partes
+            valor = valor.strip()
+            if len(valor) >= 2 and valor[0] == valor[-1] and valor[0] in "'\"":
+                valor = valor[1:-1]
+            return nome, op, valor
+
+        def aplicar(resposta, linhas):
+            if isinstance(linhas, str):
+                linhas = [linhas]
+            for linha in linhas or []:
+                lido = ler_linha(linha)
+                if not lido or lido[1] == "==":
+                    continue
+                nome, op, valor = lido
+                if op == ":=":
+                    resposta[nome] = [valor]
+                elif op == "+=":
+                    resposta.setdefault(nome, []).append(valor)
+                elif nome not in resposta:
+                    resposta[nome] = [valor]
+
+        resposta = {}
+        aplicar(resposta, request.user.attributes.get("radius_reply"))
+        grupos = sorted(
+            request.user.all_groups(),
+            key=lambda g: (int(g.attributes.get("radius_prioridade", 1000)), g.name),
+        )
+        for grupo in grupos:
+            aplicar(resposta, grupo.attributes.get("radius_reply"))
+
+        for nome, valores in resposta.items():
+            if nome in FABRICANTES:
+                vendor_id, vendor, atributo, codigo, tipo = FABRICANTES[nome]
+                define_attribute(
+                    vendor_code=vendor_id,
+                    vendor_name=vendor,
+                    attribute_name=atributo,
+                    attribute_code=codigo,
+                    attribute_type=tipo,
+                )
+            elif nome not in packet.dict.attributes:
+                ak_logger.warning("radius: atributo desconhecido, adicione em FABRICANTES", atributo=nome)
+                continue
+            tipo = packet.dict.attributes[nome].type
+            if tipo in INTEIROS:
+                valores = [int(v) if str(v).isdigit() else v for v in valores]
+            packet[nome] = valores
+
+        # Os atributos já foram gravados direto no pacote. Retornar None
+        # funciona tanto no authentik 2026.8 quanto no 2026.11+.
+        return None
+
+  - model: authentik_providers_radius.radiusprovider
+    id: provider
+    identifiers:
+      name: provedor-radius-equipamentos
+    attrs:
+      authorization_flow: !Find [authentik_flows.flow, [slug, provedor-radius-autenticacao]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      shared_secret: !Env AUTHENTIK_RADIUS_SECRET
+      # Só o FreeRADIUS fala com o outpost (chega pela porta publicada em 127.0.0.1,
+      # que o Docker mostra como IP da rede de pontes 10.233.0.0/16).
+      client_networks: !Env [AUTHENTIK_RADIUS_CLIENT_NETWORKS, "10.233.0.0/16,127.0.0.1/32"]
+      # Desligado por padrão: o 2FA vale só no login web (ver
+      # 01-fluxo-autenticacao.yaml). Com ele ligado, quem tem TOTP precisaria
+      # digitar "senha;123456" nos equipamentos.
+      mfa_support: false
+      property_mappings:
+        - !KeyOf mapping-daloradius
+
+  - model: authentik_core.application
+    id: aplicacao
+    identifiers:
+      slug: radius-equipamentos
+    attrs:
+      name: Equipamentos de rede (RADIUS)
+      provider: !KeyOf provider
+      meta_description: Login da equipe em roteadores, OLTs e switches
+      policy_engine_mode: any
+
+  # Entra quem está em radius-equipamentos (migração), radius-admin ou radius-leitura.
+  # Depois de pôr todos em radius-admin/radius-leitura, o grupo e este vínculo podem
+  # sair: apague as duas entradas daqui e o grupo e o vínculo na interface.
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-acesso
+      order: 0
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-admin
+      order: 1
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-leitura
+      order: 2
+
+  - model: authentik_outposts.outpost
+    identifiers:
+      name: provedor-radius
+    attrs:
+      type: radius
+      # Implantação manual (container "radius-outpost" em apps/radius/compose.yml).
+      service_connection: null
+      providers:
+        - !KeyOf provider
+      config:
+        authentik_host: !Env [AUTHENTIK_URL_EXTERNA, "http://authentik-server:9000"]
+        log_level: info

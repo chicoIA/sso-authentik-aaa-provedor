@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% from "_macros.html" import tabela_eventos, paginacao %}
+{% block titulo %}Eventos{% endblock %}
+{% block corpo %}<h1>Eventos</h1>
+<form class="f" method="get">
+<label>De<input type="date" name="de" value="{{ f.de[:10] }}"></label><label>Até<input type="date" name="ate" value="{{ f.ate[:10] }}"></label>
+<label>Usuário<input name="usuario" value="{{ f.usuario }}"></label><label>Equipamento (IP)<input name="nas" value="{{ f.nas }}"></label>
+<label>Tipo<select name="tipo"><option value="">todos</option>{% for t in ('authen','author','acct') %}<option {{ 'selected' if f.tipo==t }}>{{ t }}</option>{% endfor %}</select></label>
+<label>Resultado<select name="resultado"><option value="">todos</option>{% for t in ('permitido','negado','start','stop','update') %}<option {{ 'selected' if f.resultado==t }}>{{ t }}</option>{% endfor %}</select></label>
+<label>Texto do comando<input name="q" value="{{ f.q }}"></label>
+<div class="acoes"><button type="submit">Filtrar</button><a class="btn sec" href="{{ url_for('eventos') }}">Limpar</a><a class="btn sec" href="{{ url_for('eventos_csv') }}?{{ qs }}">Exportar CSV</a></div></form>
+{{ tabela_eventos(linhas) }}{{ paginacao(p, paginas, total, base, qs) }}{% endblock %}

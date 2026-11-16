@@ -1,0 +1,22 @@
+# App radius: outpost RADIUS do authentik. Só o FreeRADIUS (host) fala com ele,
+# pela porta presa ao 127.0.0.1. Não suba direto: use ./provedor up radius
+services:
+  radius-outpost:
+    image: ghcr.io/goauthentik/radius:${AUTHENTIK_TAG:-2026.8.3}
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_RADIUS_TOKEN:?preencha AUTHENTIK_RADIUS_TOKEN no .env}
+      AUTHENTIK_LISTEN__RADIUS: "[::]:1812"
+      AUTHENTIK_LISTEN__METRICS: "[::]:9300"
+    ports:
+      - 127.0.0.1:18120:1812/udp
+    networks:
+      - provedor
+
+networks:
+  provedor:
+    external: true
+    name: provedor

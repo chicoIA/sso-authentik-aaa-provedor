@@ -1,0 +1,15 @@
+#!/bin/bash
+# VM: envia à VPS (reserva) as 6 tabelas que o FreeRADIUS lê. Roda pelo timer
+# provedor-envia-radius.timer (5 min). Fonte: apps/host/reserva/ no git.
+# Leitura com --single-transaction (InnoDB): não trava o FreeRADIUS.
+# Do outro lado, provedor-recebe-radius só troca as tabelas se o dump chegou
+# inteiro. A chave só executa esse comando na VPS (authorized_keys).
+set -euo pipefail
+ENV=/opt/authentik-aaa-provedor/.env
+v() { grep -m1 "^$1=" "$ENV" | cut -d= -f2- | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+export MYSQL_PWD="$(v DALO_DB_PASS)"
+mariadb-dump --protocol=socket --socket="$(v DALO_DB_SOCKET)" -u "$(v DALO_DB_USER)" \
+    --single-transaction --no-tablespaces --skip-triggers \
+    "$(v DALO_DB_NAME)" nas radcheck radreply radgroupcheck radgroupreply radusergroup \
+  | ssh -i /root/.ssh/id_ed25519_reserva -p 2222 -o BatchMode=yes -o IdentitiesOnly=yes \
+        -o ConnectTimeout=15 root@203.0.113.85 recebe

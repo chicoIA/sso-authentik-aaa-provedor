@@ -1,0 +1,10 @@
+[Unit]
+Description=Exemplo: atualiza as listas dos grupos linux-*-or-hosts-operador a cada 5 min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Exemplo - cópia das tabelas do FreeRADIUS para a VPS a cada 5 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% from "_macros.html" import tabela_eventos, paginacao %}
+{% block titulo %}{{ rotulo }} {{ valor }}{% endblock %}
+{% block corpo %}<h1>{{ rotulo }}: {{ valor }}</h1>
+<div class="cards"><div class="card"><div class="n">{{ tot7[0] }}</div><div class="l">eventos em 7 dias</div></div>
+<div class="card"><div class="n err">{{ tot7[1] }}</div><div class="l">negados em 7 dias</div></div>
+<div class="card"><div class="n" style="font-size:1rem">{{ tot7[2]|ts }}</div><div class="l">último evento (7 dias)</div></div></div>
+<h2>{{ 'Equipamentos' if campo=='usuario' else 'Usuários' }} mais ativos (7 dias)</h2>
+<div class="tw"><table><tr><th>{{ 'Equipamento' if campo=='usuario' else 'Usuário' }}</th><th>Eventos</th><th>Negados</th><th>Último</th></tr>
+{% for r in resumo %}<tr><td>{% if campo=='usuario' %}<a href="{{ url_for('pagina_equipamento', ip=r.chave) }}">{{ r.chave }}</a>{% else %}<a href="{{ url_for('pagina_usuario', nome=r.chave) }}">{{ r.chave }}</a>{% endif %}</td><td>{{ r.n }}</td><td>{{ r.neg }}</td><td>{{ r.ultimo|ts }}</td></tr>{% else %}<tr><td colspan="4" class="mut">Sem dados.</td></tr>{% endfor %}</table></div>
+<h2>Sessões recentes</h2>
+<div class="tw"><table><tr><th>{{ 'Equipamento' if campo=='usuario' else 'Usuário' }}</th><th>Porta</th><th>Início</th><th>Fim</th><th>Duração</th></tr>
+{% for s in sess %}<tr><td>{{ s.nas_ip if campo=='usuario' else s.usuario }}</td><td>{{ s.porta }}</td><td>{{ s.inicio|ts }}</td><td>{{ s.fim|ts if s.fim else 'aberta' }}</td><td>{{ s.dur|dur }}</td></tr>{% else %}<tr><td colspan="5" class="mut">Nenhuma sessão.</td></tr>{% endfor %}</table></div>
+<h2>Eventos</h2>{{ tabela_eventos(linhas) }}{{ paginacao(p, paginas, total, base, qs) }}
+<p><a class="btn sec" href="{{ url_for('eventos_csv') }}?{{ campo_q }}">Exportar CSV</a></p>{% endblock %}

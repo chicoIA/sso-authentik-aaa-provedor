@@ -1,0 +1,100 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Grafana (https://painel.exemplo.net.br, 12.x OSS, nginx em 198.51.100.13):
+# login OIDC pelo SSO público (https://sso.exemplo.net.br). Roteiro do lado
+# do Grafana em docs/grafana-sso.md.
+#
+# - Quem entra: membros de grafana-leitura, grafana-editor ou grafana-admin. O papel
+#   no Grafana vem do claim "groups" (role_attribute_path), e role_attribute_strict
+#   recusa quem não está em nenhum dos três mesmo tendo conta no SSO.
+# - O login local do Grafana (admin) continua como reserva; só o botão do SSO é
+#   acrescentado. Se o SSO cair, entra-se pelo usuário local.
+# - client_secret: gerado pelo authentik na criação (não fica no git). Para ver:
+#   Aplicações > Providers > provedor-grafana.
+# - O servidor do Grafana chama token/userinfo no sso. pela internet: 198.51.100.13
+#   é faixa da Exemplo (passa no filtro "só Brasil" do Caddy da VPS).
+version: 1
+metadata:
+  name: Exemplo - Grafana
+  labels:
+    blueprints.goauthentik.io/description: Login OIDC do Grafana (painel.), grupos grafana-leitura/editor/admin
+entries:
+  - model: authentik_core.group
+    id: grupo-leitura
+    identifiers:
+      name: grafana-leitura
+    attrs:
+      attributes:
+        descricao: Grafana (painel.) - papel Viewer
+
+  - model: authentik_core.group
+    id: grupo-editor
+    identifiers:
+      name: grafana-editor
+    attrs:
+      attributes:
+        descricao: Grafana (painel.) - papel Editor
+
+  - model: authentik_core.group
+    id: grupo-admin
+    identifiers:
+      name: grafana-admin
+    attrs:
+      attributes:
+        descricao: Grafana (painel.) - papel Admin da organização
+
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider
+    identifiers:
+      name: provedor-grafana
+    attrs:
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      client_type: confidential
+      client_id: grafana
+      # No authentik 2026.8 o padrão é lista vazia = tudo recusado.
+      grant_types:
+        - authorization_code
+        - refresh_token
+      redirect_uris:
+        - matching_mode: strict
+          url: https://painel.exemplo.net.br/login/generic_oauth
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      sub_mode: hashed_user_id
+      include_claims_in_id_token: true
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-email]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-profile]]
+        # offline_access: sem ele o authentik não entrega refresh token e o Grafana
+        # derruba a sessão quando o access token (1 h) vence.
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-offline_access]]
+
+  - model: authentik_core.application
+    id: aplicacao
+    identifiers:
+      slug: grafana
+    attrs:
+      name: Grafana
+      provider: !KeyOf provider
+      meta_description: Painéis de monitoramento (painel.)
+      meta_launch_url: https://painel.exemplo.net.br
+      policy_engine_mode: any
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-leitura
+      order: 0
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-editor
+      order: 1
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-admin
+      order: 2

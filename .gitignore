@@ -1,0 +1,11 @@
+# Segredos: o .env real nunca vai para o git (só o .env.example gerado).
+.env
+.env.tmp
+# Dados e saídas locais dos apps (relatórios, logs de manutenção, mídia do authentik)
+apps/*/saida/
+apps/*/data/
+data/
+# Python
+__pycache__/
+*.pyc
+.venv/

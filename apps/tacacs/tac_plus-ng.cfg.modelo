@@ -1,0 +1,195 @@
+#!/usr/local/sbin/tac_plus-ng
+#
+# Modelo da configuração do tac_plus-ng da Exemplo.
+# O entrypoint.sh troca @TACACS_KEY@ pela chave (variável TACACS_KEY) e grava o
+# resultado em /run/tacacs/tac_plus-ng.cfg (tmpfs, modo 0600). Não há usuários
+# nem senhas aqui: quem autentica e autoriza é o authentik (LDAP), pelos grupos
+# tacacs-admin, tacacs-operador e tacacs-leitura.
+
+id = spawnd {
+	background = no
+	listen { port = 4949 }
+	spawn {
+		instances min = 1
+		instances max = 8
+	}
+}
+
+id = tac_plus-ng {
+
+	# ---------- Logs: contrato com o painel ----------
+	# /var/log/tacacs/eventos.tsv, uma linha por evento, separada por TAB:
+	#   data_hora_iso8601  tipo  nas_ip  usuario  porta  origem  resultado  detalhe
+	# O tac_plus-ng troca TAB/quebra de linha/bytes não imprimíveis dos campos por
+	# sequências "\ooo" (octal), então um campo nunca quebra a linha.
+	# O entrypoint.sh repete o arquivo em stdout (docker logs) com "tail -F".
+	#
+	# authen: permitido só quando a mensagem é AUTHC-PASS; o resto vira negado.
+	rewrite reescreve_authen {
+		rewrite /^(authen\t(?:[^\t]*\t){4})AUTHC-PASS\t/ "${1}permitido\t"
+		rewrite /^(authen\t(?:[^\t]*\t){4})[A-Z0-9-]*\t/ "${1}negado\t"
+	}
+	rewrite reescreve_author {
+		rewrite /^(author\t(?:[^\t]*\t){4})permit\t(.*?)(?: <cr>)?$/ "${1}permitido\t${2}"
+		rewrite /^(author\t(?:[^\t]*\t){4})[^\t]*\t(.*?)(?: <cr>)?$/ "${1}negado\t${2}"
+	}
+	# acct: só tira o " <cr>" que o Cisco manda no fim do comando.
+	rewrite reescreve_acct {
+		rewrite /^(acct\t(?:[^\t]*\t){5})(.*?)(?: <cr>)?$/ "${1}${2}"
+	}
+
+	log eventos {
+		destination = ">/var/log/tacacs/eventos.tsv"
+		timestamp = RFC5424
+		prefix = "${TIMESTAMP}${FS}"
+		rewrite = reescreve_authen
+		authentication format = "authen${FS}${nas}${FS}${user}${FS}${port}${FS}${nac}${FS}${msgid}${FS}${action} ${hint}"
+	}
+	log eventos_author {
+		destination = ">/var/log/tacacs/eventos.tsv"
+		timestamp = RFC5424
+		prefix = "${TIMESTAMP}${FS}"
+		rewrite = reescreve_author
+		authorization format = "author${FS}${nas}${FS}${user}${FS}${port}${FS}${nac}${FS}${result}${FS}${cmd}"
+	}
+	log eventos_acct {
+		destination = ">/var/log/tacacs/eventos.tsv"
+		timestamp = RFC5424
+		prefix = "${TIMESTAMP}${FS}"
+		rewrite = reescreve_acct
+		accounting format = "acct${FS}${nas}${FS}${user}${FS}${port}${FS}${nac}${FS}${accttype}${FS}${cmd}"
+	}
+	authentication log = eventos
+	authorization log = eventos_author
+	accounting log = eventos_acct
+
+	# ---------- Backend: LDAP do authentik (outpost) via MAVIS ----------
+	# Variáveis LDAP_* vêm do ambiente do container (entrypoint.sh); o MAVIS
+	# external herda o ambiente e a senha da conta de serviço não fica no arquivo.
+	mavis module = external {
+		exec = /usr/local/lib/mavis/mavis_tacplus-ng_ldap.pl
+		childs min = 1
+		childs max = 4
+	}
+	user backend = mavis
+	login backend = mavis
+	pap backend = mavis
+	# A autenticação (LDAP) vale por 60 s no cache; remover alguém de um grupo
+	# no authentik tem efeito em até 1 minuto para sessões novas.
+	mavis cache timeout = 60
+
+	# ---------- Equipamentos autorizados ----------
+	# Todos usam a mesma chave (TACACS_KEY do .env). Fora destas faixas a conexão é recusada.
+	# 10.233.0.0/16 é a rede interna do Docker (testes locais e diagnóstico a partir deste servidor).
+	device equipamentos {
+		address = 100.65.0.0/16
+		address = 100.66.0.0/16
+		address = 172.16.0.0/12
+		address = 198.51.100.0/26
+		address = 10.233.0.0/16
+		key = "@TACACS_KEY@"
+	}
+
+	# ---------- Conjuntos de equipamentos (acesso por host) ----------
+	# Editados no authentik (grupo tacacs-* com os atributos tacacs_priv_lvl e
+	# tacacs_leitura_em) e gerados pelo provedor-tacacs-conjuntos (timer de 1 min)
+	# em /etc/provedor-tacacs, montado aqui. Sem os arquivos, o entrypoint usa vazio.
+	include = /etc/tacacs/conjuntos/redes.cfg
+
+	# ---------- Perfis (um por grupo do authentik) ----------
+	# tacacs-admin: priv-lvl 15, todos os comandos.
+	profile tacacs-admin {
+		enable 15 = login
+		script {
+			if (service == shell) {
+				if (cmd == "")
+					set priv-lvl = 15
+				permit
+			}
+			# Juniper: o equipamento mapeia local-user-name para um usuário-modelo local.
+			if (service == junos-exec) {
+				set local-user-name = "tacacs-admin"
+				permit
+			}
+			permit
+		}
+	}
+
+	# tacacs-operador: priv-lvl 2. No Huawei o nível 2 é
+	# "configuração": system-view e configurar, sem usuários/AAA/arquivos/save/reboot
+	# (nível 3). Era 7, que no Huawei (níveis 0-3) equivalia a acesso total.
+	# Juniper: classe local "operator" (local-user-name).
+	# Equipamentos que pedem autorização comando a comando (Datacom DmOS; Huawei com
+	# authorization-cmd): o operador configura, mas não mexe em usuários/AAA (não pode
+	# tirar o próprio TACACS+), firmware, arquivos, reboot nem rollback.
+	# O DmOS manda o comando sem o "no" (ex.: 'no description' chega como 'description');
+	# entrar no submodo exige o comando do topo ('aaa'), então negá-lo fecha o submodo.
+	profile tacacs-operador {
+		enable = deny
+		script {
+			if (service == shell) {
+				if (cmd == "") {
+					set priv-lvl = 2
+					permit
+				}
+				if (cmd =~ /^(no )?(aaa|user|username|local-user)( |$)/) deny
+				if (cmd =~ /^(no )?(reboot|reload|request|firmware|license|copy|load|file|delete|erase|format|rollback|factory-reset|save)( |$)/) deny
+				permit
+			}
+			if (service == junos-exec) {
+				set local-user-name = "tacacs-operador"
+				permit
+			}
+			deny
+		}
+	}
+
+	# tacacs-leitura: priv-lvl 1; só comandos de consulta.
+	profile tacacs-leitura {
+		enable = deny
+		script {
+			if (service == shell) {
+				if (cmd == "") {
+					set priv-lvl = 1
+					permit
+				}
+				if (cmd =~ /^(show|display|ping|traceroute|tracert|exit|quit|logout)( |$)/) permit
+				if (cmd =~ /^(terminal (length|width)|screen-length|screen-width) /) permit
+				deny
+			}
+			if (service == junos-exec) {
+				set local-user-name = "tacacs-leitura"
+				permit
+			}
+			deny
+		}
+	}
+
+	# ---------- Quem recebe qual perfil ----------
+	# memberOf vem do authentik: cn=<grupo>,ou=groups,dc=ldap,dc=provedor,dc=com,dc=br.
+	# A ordem dá prioridade ao maior privilégio. Sem nenhum grupo que valha para o
+	# equipamento: negado.
+	ruleset {
+		rule grupos-tacacs {
+			enabled = yes
+			script {
+				# Grupos com conjunto de equipamentos (gerado; ver acima). Vêm antes dos
+				# globais: a restrição vale mesmo para quem também está em tacacs-admin.
+				include = /etc/tacacs/conjuntos/regras.cfg
+				if (memberof =~ /(?i)^cn=tacacs-admin,/) {
+					profile = tacacs-admin
+					permit
+				}
+				if (memberof =~ /(?i)^cn=tacacs-operador,/) {
+					profile = tacacs-operador
+					permit
+				}
+				if (memberof =~ /(?i)^cn=tacacs-leitura,/) {
+					profile = tacacs-leitura
+					permit
+				}
+				deny
+			}
+		}
+	}
+}

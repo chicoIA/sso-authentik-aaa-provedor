@@ -1,0 +1,8 @@
+[Unit]
+Description=Exemplo: listas de servidores dos grupos linux-*-or-hosts-operador (sudoers)
+After=network-online.target sssd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provedor-linux-sso-listas

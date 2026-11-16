@@ -1,0 +1,8 @@
+[Unit]
+Description=Atualiza a lista de IPs do Brasil do site sso (LACNIC -> Caddy)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provedor-geoip-br

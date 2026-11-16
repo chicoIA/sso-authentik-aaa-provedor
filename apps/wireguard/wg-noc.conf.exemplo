@@ -1,0 +1,20 @@
+# VPN do NOC (WireGuard): concentrador. Modelo; ver docs/wireguard.md.
+# Destino: /etc/wireguard/wg-noc.conf (chmod 600) num servidor Linux DENTRO da rede de
+# gerência (ou no roteador de borda, com a sintaxe dele).
+[Interface]
+PostUp = wg set %i private-key /etc/wireguard/noc.key
+Address = 10.99.99.1/24
+ListenPort = 51820
+MTU = 1420
+
+# Um [Peer] por pessoa (ou por dispositivo). Desligar alguém = apagar o bloco e
+# "wg syncconf wg-noc <(wg-quick strip wg-noc)".
+[Peer]
+# joao.silva (notebook)
+PublicKey = <CHAVE_PUBLICA_DA_PESSOA>
+AllowedIPs = 10.99.99.11/32
+
+[Peer]
+# maria.souza (notebook)
+PublicKey = <CHAVE_PUBLICA_DA_PESSOA>
+AllowedIPs = 10.99.99.12/32

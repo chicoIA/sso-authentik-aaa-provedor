@@ -1,0 +1,10 @@
+[Unit]
+Description=Exemplo - copia as tabelas do FreeRADIUS para a reserva na VPS
+After=network-online.target mariadb.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provedor-envia-radius
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120

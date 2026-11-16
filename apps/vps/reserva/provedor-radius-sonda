@@ -1,0 +1,78 @@
+#!/usr/bin/python3 -I
+# Sonda RADIUS sem dependências. Fonte: apps/vps/reserva/ no git.
+#
+#   SONDA_SEGREDO=... provedor-radius-sonda <ip> [porta] status
+#   SONDA_SEGREDO=... provedor-radius-sonda <ip> [porta] auth <usuario> <senha>
+#
+# O segredo vem pela variável de ambiente (não aparece no "ps").
+# Saída: o tipo da resposta (Access-Accept, Access-Reject...) e código 0;
+# sem resposta: "sem-resposta" e código 1. Erro de uso: código 2.
+import hashlib, hmac, os, socket, struct, sys
+
+TIPOS = {2: "Access-Accept", 3: "Access-Reject", 11: "Access-Challenge"}
+
+
+def atributo(tipo, valor):
+    return struct.pack("!BB", tipo, len(valor) + 2) + valor
+
+
+def senha_pap(senha, segredo, autenticador):
+    senha = senha.encode()
+    senha = senha.ljust(max(16, -(-len(senha) // 16) * 16), b"\0")
+    saida, anterior = b"", autenticador
+    for i in range(0, len(senha), 16):
+        b = hashlib.md5(segredo + anterior).digest()
+        bloco = bytes(x ^ y for x, y in zip(senha[i:i + 16], b))
+        saida += bloco
+        anterior = bloco
+    return saida
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) < 2:
+        print(__doc__ or "uso", file=sys.stderr)
+        return 2
+    ip = args.pop(0)
+    porta = int(args.pop(0)) if args[0].isdigit() else 1812
+    modo = args.pop(0)
+    segredo = os.environ.get("SONDA_SEGREDO", "").encode()
+    if not segredo or modo not in ("status", "auth"):
+        return 2
+    ident = os.urandom(1)[0]
+    autenticador = os.urandom(16)
+    if modo == "status":
+        codigo, attrs = 12, b""
+    else:
+        if len(args) != 2:
+            return 2
+        codigo = 1
+        attrs = atributo(1, args[0].encode()) + atributo(2, senha_pap(args[1], segredo, autenticador))
+        attrs += atributo(4, socket.inet_aton("127.0.0.1"))  # NAS-IP-Address
+    attrs += atributo(80, b"\0" * 16)  # Message-Authenticator
+    pacote = struct.pack("!BBH", codigo, ident, 20 + len(attrs)) + autenticador + attrs
+    ma = hmac.new(segredo, pacote, hashlib.md5).digest()
+    pacote = pacote[:-16] + ma
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(float(os.environ.get("SONDA_TEMPO", "3")))
+    try:
+        s.sendto(pacote, (ip, porta))
+        while True:
+            dados, _ = s.recvfrom(4096)
+            if len(dados) >= 20 and dados[1] == ident:
+                break
+    except (socket.timeout, OSError):
+        print("sem-resposta")
+        return 1
+    # Autenticador da resposta: MD5(código+id+tam+autenticador do pedido+attrs+segredo)
+    esperado = hashlib.md5(dados[:4] + autenticador + dados[20:] + segredo).digest()
+    if esperado != dados[4:20]:
+        print("resposta-com-segredo-errado")
+        return 1
+    print(TIPOS.get(dados[0], "codigo-%d" % dados[0]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

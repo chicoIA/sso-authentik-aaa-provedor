@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% from "_macros.html" import paginacao %}
+{% macro tab(sessoes) %}<div class="tw"><table><tr><th>Usuário</th><th>Equipamento</th><th>Porta</th><th>Origem</th><th>Início</th><th>Fim</th><th>Duração</th></tr>
+{% for s in sessoes %}<tr><td><a href="{{ url_for('pagina_usuario', nome=s.usuario) }}">{{ s.usuario }}</a></td><td><a href="{{ url_for('pagina_equipamento', ip=s.nas_ip) }}">{{ s.nas_ip }}</a></td>
+<td>{{ s.porta }}</td><td>{{ s.origem }}</td><td>{{ s.inicio|ts }}</td><td>{% if s.fim %}{{ s.fim|ts }}{% else %}<span class="wr">aberta</span>{% endif %}</td><td>{{ s.dur|dur }}</td></tr>
+{% else %}<tr><td colspan="7" class="mut">Nenhuma sessão.</td></tr>{% endfor %}</table></div>{% endmacro %}
+{% block corpo %}<h1>Sessões (accounting)</h1>
+<form class="f" method="get"><label>Usuário<input name="usuario" value="{{ u }}"></label><label>Equipamento (IP)<input name="nas" value="{{ n }}"></label>
+<label>Estado<select name="estado"><option value="">todas</option><option value="abertas" {{ 'selected' if estado=='abertas' }}>abertas</option><option value="encerradas" {{ 'selected' if estado=='encerradas' }}>encerradas</option></select></label>
+<div class="acoes"><button type="submit">Filtrar</button><a class="btn sec" href="{{ url_for('sessoes') }}">Limpar</a></div></form>
+{{ tab(linhas) }}{{ paginacao(p, paginas, total, base, qs) }}
+<p class="mut">Sessões sem início aparecem quando só o "stop" foi visto; "aberta" = ainda sem "stop".</p>{% endblock %}

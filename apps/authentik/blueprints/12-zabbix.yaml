@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Zabbix 7.0 (https://zabbix.exemplo.net.br, frontend em 100.66.80.210 atrás do
+# nginx 198.51.100.13): login SAML pelo SSO público. O Zabbix 7.0 não tem OIDC; SAML é o
+# caminho oficial. Roteiro do lado do Zabbix em docs/zabbix-sso.md.
+#
+# Para aplicar: copiar para apps/authentik/blueprints/12-zabbix.yaml (pasta vigiada,
+# aplicado na hora). Depois disso a cópia de lá é a que vale; manter as duas iguais.
+#
+# - Quem entra: membros de zabbix-leitura, zabbix-operador ou zabbix-admin. O Zabbix
+#   cria a conta no primeiro login (JIT) e escolhe papel e grupos de usuário pelo
+#   atributo de grupos do SAML (mapeamento feito na tela do Zabbix).
+# - SAML só passa pelo navegador: o servidor do Zabbix não precisa alcançar o sso.
+# - Login local do Zabbix (Admin) e o usuário de API do Grafana continuam como estão.
+# - state: created nos grupos: descrição editada na tela não é sobrescrita.
+version: 1
+metadata:
+  name: Exemplo - Zabbix
+  labels:
+    blueprints.goauthentik.io/description: Login SAML do Zabbix (zabbix.), grupos zabbix-leitura/operador/admin
+entries:
+  - model: authentik_core.group
+    id: grupo-leitura
+    state: created
+    identifiers:
+      name: zabbix-leitura
+    attrs:
+      attributes:
+        descricao: Zabbix - User role, só leitura
+
+  - model: authentik_core.group
+    id: grupo-operador
+    state: created
+    identifiers:
+      name: zabbix-operador
+    attrs:
+      attributes:
+        descricao: Zabbix - Admin role (edita hosts, triggers, reconhece eventos)
+
+  - model: authentik_core.group
+    id: grupo-admin
+    state: created
+    identifiers:
+      name: zabbix-admin
+    attrs:
+      attributes:
+        descricao: Zabbix - Super admin role
+
+  - model: authentik_providers_saml.samlprovider
+    id: provider
+    identifiers:
+      name: provedor-zabbix
+    attrs:
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      acs_url: https://zabbix.exemplo.net.br/index_sso.php?acs
+      sls_url: https://zabbix.exemplo.net.br/index_sso.php?sls
+      sls_binding: redirect
+      sp_binding: post
+      # SP entity ID: o mesmo valor vai no campo "SP entity ID" do Zabbix.
+      audience: zabbix
+      # Entity ID do IdP fixo (sem isso o authentik monta pelo endereço da requisição,
+      # que muda se alguém entrar por outro nome). Vai no "IdP entity ID" do Zabbix.
+      issuer_override: https://sso.exemplo.net.br/application/saml/zabbix/metadata/
+      signing_kp: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      sign_assertion: true
+      sign_response: true
+      # NameID = login do authentik (igual ao "Username" do Zabbix).
+      name_id_mapping: !Find [authentik_providers_saml.samlpropertymapping, [managed, goauthentik.io/providers/saml/username]]
+      property_mappings:
+        - !Find [authentik_providers_saml.samlpropertymapping, [managed, goauthentik.io/providers/saml/username]]
+        - !Find [authentik_providers_saml.samlpropertymapping, [managed, goauthentik.io/providers/saml/name]]
+        - !Find [authentik_providers_saml.samlpropertymapping, [managed, goauthentik.io/providers/saml/email]]
+        - !Find [authentik_providers_saml.samlpropertymapping, [managed, goauthentik.io/providers/saml/groups]]
+
+  - model: authentik_core.application
+    id: aplicacao
+    identifiers:
+      slug: zabbix
+    attrs:
+      name: Zabbix
+      provider: !KeyOf provider
+      meta_description: Monitoramento (zabbix.)
+      meta_launch_url: https://zabbix.exemplo.net.br/index_sso.php
+      policy_engine_mode: any
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-leitura
+      order: 0
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-operador
+      order: 1
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-admin
+      order: 2

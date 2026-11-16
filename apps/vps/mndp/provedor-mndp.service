@@ -1,0 +1,16 @@
+[Unit]
+Description=Exemplo - anuncia a VPS por MNDP nos túneis wg-* (vizinho MikroTik)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/provedor-mndp
+Restart=always
+RestartSec=10
+DynamicUser=no
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,90 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Fluxo de autenticação usado pelo outpost RADIUS (acesso da equipe aos equipamentos).
+#
+# É um fluxo separado do login web para que mudanças no login do portal
+# (captcha, WebAuthn, etc.) não quebrem o login nos equipamentos.
+# O outpost só consegue executar: identificação, senha, validação de MFA por
+# código (TOTP/estático/DUO) e login.
+#
+# Padrão do repositório: sem MFA nos equipamentos. O 2FA (TOTP) vale no login web;
+# por RADIUS e por TACACS+ (LDAP) entra-se só com usuário e senha, mesmo quem tem
+# TOTP cadastrado. Para exigir "senha;código" no SSH dos equipamentos: docs/ssh-2fa.md.
+version: 1
+metadata:
+  name: Exemplo - Fluxo de autenticação (RADIUS e LDAP)
+  labels:
+    blueprints.goauthentik.io/description: Fluxo usado pelos outposts RADIUS e LDAP
+entries:
+  - model: authentik_flows.flow
+    id: fluxo
+    identifiers:
+      slug: provedor-radius-autenticacao
+    attrs:
+      name: Exemplo - Autenticação (outposts)
+      title: Exemplo - Autenticação (outposts)
+      designation: authentication
+      # O outpost se autentica com o token dele; o usuário final nunca abre este fluxo.
+      authentication: none
+
+  - model: authentik_stages_identification.identificationstage
+    id: identificacao
+    identifiers:
+      name: provedor-radius-identificacao
+    attrs:
+      # No daloRADIUS o login era só o username; mantemos igual.
+      user_fields:
+        - username
+      case_insensitive_matching: false
+      pretend_user_exists: true
+      show_matched_user: false
+
+  - model: authentik_stages_password.passwordstage
+    id: senha
+    identifiers:
+      name: provedor-radius-senha
+    attrs:
+      backends:
+        - authentik.core.auth.InbuiltBackend
+      failed_attempts_before_cancel: 1
+
+  # Estágio de MFA dos outposts: definido, mas fora do fluxo (ver o topo). Entra com
+  # apps/authentik/opcionais/mfa-equipamentos.yaml (vínculo de ordem 30) mais
+  # mfa_support: true no provider (quem tem TOTP digita "senha;123456").
+  - model: authentik_stages_authenticator_validate.authenticatorvalidatestage
+    id: mfa
+    identifiers:
+      name: provedor-radius-mfa
+    attrs:
+      device_classes:
+        - totp
+        - static
+      not_configured_action: skip
+
+  - model: authentik_stages_user_login.userloginstage
+    id: login
+    identifiers:
+      name: provedor-radius-login
+    attrs:
+      # A sessão só precisa existir enquanto o outpost consulta a autorização.
+      session_duration: minutes=5
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf fluxo
+      stage: !KeyOf identificacao
+      order: 10
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf fluxo
+      stage: !KeyOf senha
+      order: 20
+  # (O vínculo do estágio mfa, ordem 30, fica no blueprint opcional. Para tirar um
+  # vínculo já aplicado, apague-o na interface; não usar
+  # "state: absent" em flowstagebinding: no authentik 2026.8 a reaplicação falha
+  # com "FlowStageBinding has no policybindingmodel_ptr".)
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf fluxo
+      stage: !KeyOf login
+      order: 100

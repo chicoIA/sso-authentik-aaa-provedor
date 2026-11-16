@@ -1,0 +1,168 @@
+#!/bin/bash
+# Login em Debian/Ubuntu pelo SSO (authentik via LDAP + SSSD). Roteiro: docs/linux-sso.md.
+# Fonte: apps/linux/ no git. Copiar esta pasta para o servidor e rodar como root:
+#
+#   ./provedor-linux-sso testar   [IP]   só confere rede, certificado e a senha da conta de serviço
+#   ./provedor-linux-sso instalar [IP]   instala e configura (pede a senha de linux-servico)
+#   ./provedor-linux-sso desfazer        remove a configuração (pacotes ficam)
+#
+# IP = endereço do LDAP do authentik visto por este servidor (padrão 172.16.7.10).
+# Root local e usuários locais continuam funcionando sempre: o SSSD só acrescenta
+# os usuários do SSO. Se o SSO cair, quem já entrou antes entra pelo cache (offline).
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+NOME=ldap-sso.provedor.interno
+IP="${2:-172.16.7.10}"
+BASE="dc=ldap,dc=provedor,dc=com,dc=br"
+BIND="cn=linux-servico,ou=users,$BASE"
+CA=/etc/ssl/provedor/ldap-sso.crt
+BAK=/root/bak-provedor-linux-sso
+
+[ "$(id -u)" = 0 ] || { echo "rodar como root" >&2; exit 1; }
+. /etc/os-release
+case "$ID" in debian|ubuntu) ;; *) echo "só Debian/Ubuntu (achei $ID)" >&2; exit 1 ;; esac
+
+hosts() {
+    grep -qE "[[:space:]]$NOME([[:space:]]|\$)" /etc/hosts && sed -i "/[[:space:]]$NOME\([[:space:]]\|\$\)/d" /etc/hosts
+    echo "$IP $NOME   # provedor-linux-sso" >> /etc/hosts
+}
+
+pede_senha() {
+    if [ -t 0 ]; then read -rsp "Senha da conta linux-servico: " SENHA; echo; else read -r SENHA; fi
+    [ -n "$SENHA" ] || { echo "senha vazia" >&2; exit 1; }
+}
+
+testa_bind() {
+    # (o outpost do authentik não implementa o "whoami": testa com uma busca base)
+    LDAPTLS_CACERT="$1" ldapsearch -LLL -x -H "ldaps://$NOME" -D "$BIND" -y <(printf %s "$SENHA") \
+        -s base -b "$BASE" dn >/dev/null
+}
+
+case "${1:-}" in
+testar)
+    command -v ldapsearch >/dev/null || { apt-get -qq update; DEBIAN_FRONTEND=noninteractive apt-get -y -qq install ldap-utils >/dev/null; }
+    getent hosts "$NOME" >/dev/null || { echo "(sem $NOME no /etc/hosts; testando por $IP)"; hosts; ACRESCENTOU=1; }
+    timeout 5 bash -c "</dev/tcp/$IP/636" && echo "ok: porta 636 aberta em $IP" || { echo "FALHA: $IP:636 inacessível" >&2; exit 1; }
+    echo | timeout 5 openssl s_client -connect "$IP:636" -servername "$NOME" -verify_hostname "$NOME" -partial_chain -verify_return_error -CAfile "$DIR/ldap-sso.crt" >/dev/null 2>&1 \
+        && echo "ok: certificado confere" || { echo "FALHA: certificado do LDAP não é o esperado (ldap-sso.crt)" >&2; exit 1; }
+    pede_senha
+    testa_bind "$DIR/ldap-sso.crt" && echo "ok: conta de serviço entra" || { echo "FALHA: bind da linux-servico" >&2; exit 1; }
+    [ -n "${ACRESCENTOU:-}" ] && sed -i "/# provedor-linux-sso\$/d" /etc/hosts
+    exit 0 ;;
+
+instalar)
+    pede_senha
+    for u in $(getent passwd | awk -F: '$3>=2000 && $3<60000 {print $1":"$3}'); do
+        echo "AVISO: usuário local com UID >= 2000 ($u); o SSO usa 2000+ (conferir colisão)" >&2
+    done
+    mkdir -p "$BAK"; chmod 700 "$BAK"
+    # backup só na primeira instalação (reinstalar não sobrescreve o original)
+    for f in /etc/hosts /etc/sssd/sssd.conf /etc/security/group.conf /etc/nsswitch.conf; do
+        [ -f "$f" ] && [ ! -e "$BAK/$(basename "$f")" ] && cp -a "$f" "$BAK/" || true
+    done
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -qq update
+    apt-get -y -qq install sssd-ldap sssd-tools libnss-sss libpam-sss ldap-utils >/dev/null
+    hosts
+    install -d -m 755 /etc/ssl/provedor
+    install -m 644 "$DIR/ldap-sso.crt" "$CA"
+    testa_bind "$CA" || { echo "FALHA: bind da linux-servico (senha ou rede); nada configurado" >&2; exit 1; }
+
+    umask 077
+    cat > /etc/sssd/sssd.conf <<EOF
+# provedor-linux-sso — login pelo SSO (authentik). Fonte: apps/linux/ no git.
+[sssd]
+services = nss, pam
+domains = provedor
+
+[nss]
+filter_users = root
+filter_groups = root
+
+[domain/provedor]
+id_provider = ldap
+auth_provider = ldap
+chpass_provider = none
+access_provider = simple
+simple_allow_groups = linux-admin, linux-operador, linux-leitura, linux-admin-or-hosts-operador, linux-leitura-or-hosts-operador
+
+ldap_uri = ldaps://$NOME
+ldap_tls_reqcert = demand
+ldap_tls_cacert = $CA
+ldap_search_base = $BASE
+ldap_user_search_base = ou=users,$BASE
+ldap_group_search_base = ou=groups,$BASE
+ldap_default_bind_dn = $BIND
+ldap_default_authtok_type = password
+ldap_default_authtok = $SENHA
+
+ldap_schema = rfc2307bis
+ldap_user_object_class = posixAccount
+ldap_user_name = cn
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_user_home_directory = homeDirectory
+ldap_user_gecos = displayName
+ldap_group_object_class = posixGroup
+ldap_group_name = cn
+ldap_group_member = member
+ldap_group_gid_number = gidNumber
+
+min_id = 2000
+default_shell = /bin/bash
+fallback_homedir = /home/%u
+cache_credentials = true
+# Mudança de grupo no authentik vale em até 5 min (ou na hora com: sss_cache -E)
+entry_cache_timeout = 300
+offline_credentials_expiration = 7
+EOF
+    chmod 600 /etc/sssd/sssd.conf
+    umask 022
+
+    # leitura: logs e status sem sudo (grupos locais adm e systemd-journal no login)
+    sed -i '/# provedor-linux-sso$/d' /etc/security/group.conf
+    echo '*;*;%linux-leitura|%linux-operador|%linux-admin-or-hosts-operador|%linux-leitura-or-hosts-operador;Al0000-2400;adm,systemd-journal   # provedor-linux-sso' >> /etc/security/group.conf
+    cat > /usr/share/pam-configs/provedor-group <<'EOF'
+Name: Exemplo SSO: grupos locais adm/systemd-journal para os grupos linux-* sem root
+Default: yes
+Priority: 0
+Auth-Type: Additional
+Auth:
+	optional pam_group.so
+EOF
+    pam-auth-update --enable sss mkhomedir provedor-group --force >/dev/null
+
+    install -m 440 "$DIR/provedor-sudoers" /etc/sudoers.d/provedor-sso.novo
+    if visudo -cf /etc/sudoers.d/provedor-sso.novo >/dev/null; then mv /etc/sudoers.d/provedor-sso.novo /etc/sudoers.d/provedor-sso
+    else rm -f /etc/sudoers.d/provedor-sso.novo; echo "FALHA: sudoers inválido; não instalado" >&2; exit 1; fi
+
+    systemctl enable -q sssd
+    systemctl restart sssd
+    sss_cache -E 2>/dev/null || true
+
+    # grupos por lista (linux-*-or-hosts-operador): sudoers gerado a partir do LDAP
+    install -m 755 "$DIR/provedor-linux-sso-listas" /usr/local/sbin/provedor-linux-sso-listas
+    install -m 644 "$DIR/provedor-linux-sso-listas.service" "$DIR/provedor-linux-sso-listas.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable -q --now provedor-linux-sso-listas.timer
+    /usr/local/sbin/provedor-linux-sso-listas || echo "AVISO: listas não aplicadas agora (ver: provedor-linux-sso-listas status)"
+    echo "--- conferência"
+    getent group linux-admin linux-operador linux-leitura linux-admin-or-hosts-operador linux-leitura-or-hosts-operador || echo "AVISO: grupos ainda não aparecem (vazios no authentik?)"
+    echo "Pronto. Teste numa sessão NOVA (sem fechar esta): ssh <usuario-do-sso>@$(hostname -I | awk '{print $1}')"
+    sshd -T 2>/dev/null | grep -qiE '^(passwordauthentication|kbdinteractiveauthentication) yes' \
+        || echo "AVISO: o sshd não aceita senha; ver docs/linux-sso.md (bloco Match Group)" ;;
+
+desfazer)
+    systemctl disable --now -q provedor-linux-sso-listas.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/provedor-linux-sso-listas.service /etc/systemd/system/provedor-linux-sso-listas.timer \
+          /usr/local/sbin/provedor-linux-sso-listas
+    systemctl daemon-reload
+    systemctl disable --now -q sssd 2>/dev/null || true
+    rm -f /etc/sudoers.d/provedor-sso /etc/sudoers.d/provedor-sso-listas /etc/sssd/sssd.conf
+    sed -i '/# provedor-linux-sso$/d' /etc/hosts /etc/security/group.conf
+    rm -f /usr/share/pam-configs/provedor-group
+    pam-auth-update --disable sss provedor-group --force >/dev/null || true
+    echo "configuração removida (pacotes e diretórios /home dos usuários do SSO ficaram)" ;;
+
+*) echo "uso: $0 testar|instalar [IP] | desfazer" >&2; exit 2 ;;
+esac

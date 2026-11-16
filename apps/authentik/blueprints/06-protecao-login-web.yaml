@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Proteção contra força bruta no LOGIN WEB (https://sso.exemplo.net.br).
+#
+# Só o fluxo web (default-authentication-flow). O fluxo dos outposts RADIUS/LDAP
+# (provedor-radius-autenticacao) NÃO recebe esta política: lá todos os logins
+# chegam com o IP do FreeRADIUS, e um bloqueio por IP pararia o RADIUS inteiro.
+#
+# Regra (o fluxo usa policy_engine_mode "any" = basta UMA passar):
+#   - IP de fora com 5 senhas erradas (pontuação <= -5) fica sem acesso ao login
+#     até a reputação expirar (AUTHENTIK_REPUTATION__EXPIRY, padrão 24 h);
+#   - rede interna e prefixos públicos do seu AS nunca são bloqueados: o escritório sai
+#     por um IP só (NAT) e 5 erros de uma pessoa bloqueariam todos.
+# A pontuação usa o IP real do cliente (o Caddy da VPS manda X-Forwarded-For e o
+# authentik confia em 172.16.0.0/12, de onde o proxy chega pelo túnel).
+#
+# Desbloquear um IP antes de expirar: Personalização > Políticas > Reputação
+# (lista de pontuações) e apague a linha do IP.
+version: 1
+metadata:
+  name: Exemplo - Proteção do login web
+  labels:
+    blueprints.goauthentik.io/description: Força bruta (reputação por IP) no login web, sem afetar RADIUS/LDAP
+entries:
+  - model: authentik_policies_reputation.reputationpolicy
+    id: forca_bruta
+    identifiers:
+      name: provedor-login-web-forca-bruta
+    attrs:
+      check_ip: true
+      # Por usuário não: falhas no RADIUS também contam para o usuário e
+      # bloqueariam o login web dele; e permitiria travar a conta de terceiros.
+      check_username: false
+      # A política "passa" quando a pontuação está RUIM (<= threshold);
+      # por isso o vínculo abaixo é negado.
+      threshold: -5
+
+  - model: authentik_policies_expression.expressionpolicy
+    id: rede_interna
+    identifiers:
+      name: provedor-login-web-rede-interna
+    attrs:
+      expression: |
+        import ipaddress
+        redes = (
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+            # Prefixos públicos do seu AS (exemplo; troque pelos seus)
+            "198.51.100.0/24", "192.0.2.0/24", "2001:db8::/32",
+        )
+        ip = ak_client_ip
+        return any(ip in ipaddress.ip_network(r) for r in redes)
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+      policy: !KeyOf forca_bruta
+    attrs:
+      negate: true
+      order: 0
+      timeout: 5
+      failure_result: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+      policy: !KeyOf rede_interna
+    attrs:
+      order: 10
+      timeout: 5
+      failure_result: false

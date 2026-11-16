@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Login em servidores Linux (Debian/Ubuntu) pelo SSO, via SSSD + LDAP (ldaps://, porta 636).
+# Roteiro do lado do servidor: docs/linux-sso.md (arquivos prontos em apps/linux/).
+#
+#   linux-admin     vira root (sudo -i / sudo su -)
+#   linux-operador  status e start/stop/restart/reload de serviços já instalados; sem root
+#   linux-leitura   só status, logs e ferramentas de diagnóstico (ping, traceroute, mtr...)
+#
+# Por lista de servidores (padrão do TACACS+; lista no atributo linux_operador_em do grupo,
+# editada na interface, uma linha "IP: nome" por servidor):
+#   linux-admin-or-hosts-operador    admin em todos, operador nos servidores da lista
+#   linux-leitura-or-hosts-operador  leitura em todos, operador nos servidores da lista
+# Cada servidor lê a lista pelo LDAP (provedor-linux-sso-listas, a cada 5 min).
+#
+# As permissões ficam no sudoers de cada servidor (/etc/sudoers.d/provedor-sso); aqui só
+# os grupos e o direito de fazer bind no LDAP. Quem não está em nenhum grupo (nem em
+# ldap-acesso/tacacs-*) recebe "Insufficient access" no bind.
+#
+# linux-servico: conta de serviço que o SSSD usa para buscar usuários e grupos. A senha
+# NÃO fica no git: é definida pela API e guardada em /root/linux-ldap-servico.senha (600).
+version: 1
+metadata:
+  name: Exemplo - Login Linux
+  labels:
+    blueprints.goauthentik.io/description: Grupos linux-admin/operador/leitura e conta de serviço do SSSD
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        path: provedor/ldap/03-ldap.yaml
+      required: true
+
+  - model: authentik_core.group
+    id: grupo-admin
+    identifiers:
+      name: linux-admin
+    attrs:
+      attributes:
+        descricao: Linux - root via sudo (sudo -i / sudo su -)
+
+  - model: authentik_core.group
+    id: grupo-operador
+    identifiers:
+      name: linux-operador
+    attrs:
+      attributes:
+        descricao: Linux - status e start/stop/restart de serviços, sem root
+
+  - model: authentik_core.group
+    id: grupo-leitura
+    identifiers:
+      name: linux-leitura
+    attrs:
+      attributes:
+        descricao: Linux - só status, logs e diagnóstico (ping, traceroute, mtr)
+
+  - model: authentik_core.user
+    identifiers:
+      username: linux-servico
+    attrs:
+      name: Conta de serviço LDAP do SSSD (servidores Linux)
+      type: service_account
+      path: provedor/servicos
+      permissions:
+        - authentik_providers_ldap.search_full_directory
+      groups:
+        - !Find [authentik_core.group, [name, ldap-acesso]]
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-admin
+      order: 20
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-operador
+      order: 21
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-leitura
+      order: 22
+
+  # Grupos por lista. state: created = o blueprint cria, mas não sobrescreve a lista
+  # editada na interface. Lista vazia = admin (ou leitura) em todos.
+  - model: authentik_core.group
+    state: created
+    id: grupo-admin-or-hosts-operador
+    identifiers:
+      name: linux-admin-or-hosts-operador
+    attrs:
+      attributes:
+        linux_operador_em: {}
+        descricao: Linux - admin em todos, operador nos servidores de linux_operador_em
+
+  - model: authentik_core.group
+    state: created
+    id: grupo-leitura-or-hosts-operador
+    identifiers:
+      name: linux-leitura-or-hosts-operador
+    attrs:
+      attributes:
+        linux_operador_em: {}
+        descricao: Linux - leitura em todos, operador nos servidores de linux_operador_em
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-admin-or-hosts-operador
+      order: 23
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-leitura-or-hosts-operador
+      order: 24

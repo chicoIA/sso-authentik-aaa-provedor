@@ -1,0 +1,121 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Grupos do TACACS+ e acesso deles ao diretório LDAP.
+# Aplicado automaticamente (montado em /blueprints/provedor/tacacs).
+# Depende de provedor/ldap/03-ldap.yaml (aplicação provedor-ldap).
+#
+# Quem entra em um destes grupos pode logar nos equipamentos por TACACS+:
+#   tacacs-admin     priv-lvl 15, todos os comandos
+#   tacacs-operador  priv-lvl 2 (Huawei: configuração; Juniper: classe operator)
+#   tacacs-leitura   priv-lvl 1, só comandos de consulta (show, display, ping...)
+# Quem está em mais de um recebe o maior privilégio. Quem não está em nenhum é negado.
+# O atributo tacacs_priv_lvl documenta o nível; o mapeamento real fica no tac_plus-ng
+# (apps/tacacs/tac_plus-ng.cfg.modelo).
+version: 1
+metadata:
+  name: Exemplo - TACACS+
+  labels:
+    blueprints.goauthentik.io/description: Grupos tacacs-admin, tacacs-operador e tacacs-leitura
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        path: provedor/ldap/03-ldap.yaml
+      required: true
+
+  - model: authentik_core.group
+    # created: o blueprint cria, mas não sobrescreve o que for editado na interface
+    # (ex.: a lista tacacs_leitura_em).
+    state: created
+    id: grupo-admin
+    identifiers:
+      name: tacacs-admin
+    attrs:
+      attributes:
+        tacacs_priv_lvl: 15
+        descricao: TACACS+ nível 15, todos os comandos
+
+  - model: authentik_core.group
+    # created: o blueprint cria, mas não sobrescreve o que for editado na interface
+    # (ex.: a lista tacacs_leitura_em).
+    state: created
+    id: grupo-operador
+    identifiers:
+      name: tacacs-operador
+    attrs:
+      attributes:
+        tacacs_priv_lvl: 7
+        descricao: TACACS+ operador (Huawei nível 2, Juniper classe operator)
+
+  - model: authentik_core.group
+    # created: o blueprint cria, mas não sobrescreve o que for editado na interface
+    # (ex.: a lista tacacs_leitura_em).
+    state: created
+    id: grupo-leitura
+    identifiers:
+      name: tacacs-leitura
+    attrs:
+      attributes:
+        tacacs_priv_lvl: 1
+        descricao: TACACS+ nível 1, só comandos de consulta
+
+  # Os três grupos precisam poder fazer bind na aplicação LDAP (o TACACS+ valida a
+  # senha do usuário com um bind no outpost).
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-admin
+      order: 10
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-operador
+      order: 11
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-leitura
+      order: 12
+
+  # Acesso por conjunto de equipamentos ("net" no tac_plus-ng.cfg.modelo).
+  # tacacs-admin-or-hosts-leitura: admin em todos os equipamentos, menos nos da lista
+  # tacacs_leitura_em (editada na interface), onde só tem leitura.
+  - model: authentik_core.group
+    # created: o blueprint cria, mas não sobrescreve o que for editado na interface
+    # (ex.: a lista tacacs_leitura_em).
+    state: created
+    id: grupo-admin-or-hosts-leitura
+    identifiers:
+      name: tacacs-admin-or-hosts-leitura
+    attrs:
+      attributes:
+        tacacs_priv_lvl: 15
+        descricao: TACACS+ admin em tudo, só leitura nos equipamentos de tacacs_leitura_em
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-admin-or-hosts-leitura
+      order: 14
+
+  # tacacs-admin-or-hosts-operador: admin em todos os equipamentos, menos nos da lista
+  # tacacs_operador_em (editada na interface), onde é operador. Lista vazia = admin em tudo.
+  - model: authentik_core.group
+    # created: o blueprint cria, mas não sobrescreve o que for editado na interface.
+    state: created
+    id: grupo-admin-or-hosts-operador
+    identifiers:
+      name: tacacs-admin-or-hosts-operador
+    attrs:
+      attributes:
+        tacacs_priv_lvl: 15
+        tacacs_operador_em: {}
+        descricao: TACACS+ admin em tudo, operador nos equipamentos de tacacs_operador_em
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, provedor-ldap]]
+      group: !KeyOf grupo-admin-or-hosts-operador
+      order: 15

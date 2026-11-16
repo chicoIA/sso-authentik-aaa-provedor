@@ -1,0 +1,33 @@
+# Caddy da VPS: termina o HTTPS do sso.<domínio> e encaminha ao authentik ativo
+# (VM pelo túnel; reserva local quando ativada). Instalar em /opt/proxy:
+#   mkdir -p /opt/proxy && cp compose.yml Caddyfile /opt/proxy/ && cd /opt/proxy
+#   docker compose up -d        # projeto "proxy" -> container proxy-caddy-1
+# Antes do primeiro "up", gere a lista de países e o destino:
+#   /usr/local/sbin/provedor-geoip-br          # cria /data/provedor/brasil.caddy
+#   cp sso-destino.caddy /var/lib/docker/volumes/proxy_caddy_data/_data/provedor/
+name: proxy
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - /opt/proxy/Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 128m
+volumes:
+  caddy_data:
+  caddy_config:
+# IPv6 na rede do Caddy: sem isso, quem chega por IPv6 aparece com o IP do docker-proxy
+# (ver o daemon.json em apps/vps/README.md).
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+        - subnet: fd00:db8:1:1::/64

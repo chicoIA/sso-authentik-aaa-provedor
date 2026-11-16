@@ -1,0 +1,21 @@
+# /etc/sudoers.d/provedor-sso — login Linux pelo SSO (docs/linux-sso.md). Fonte: apps/linux/ no git.
+# Grupos vêm do authentik via SSSD. sudo pede a senha do SSO da própria pessoa.
+#
+# linux-admin: root (sudo -i, sudo su -, qualquer comando).
+%linux-admin ALL=(ALL:ALL) ALL
+
+# linux-operador: liga/desliga/reinicia serviços e containers que já existem. Não vira root,
+# não instala, não edita unidade (systemctl edit/enable/mask/daemon-reload ficam de fora).
+# NOEXEC: impede que o comando abra um shell (ex.: pager do systemctl).
+Cmnd_Alias NN_SERVICOS = /usr/bin/systemctl start *, /usr/bin/systemctl stop *, \
+                         /usr/bin/systemctl restart *, /usr/bin/systemctl reload *, \
+                         /usr/bin/systemctl try-restart *, \
+                         /usr/bin/docker start *, /usr/bin/docker stop *, /usr/bin/docker restart *, \
+                         /usr/bin/docker ps, /usr/bin/docker ps *, /usr/bin/docker logs *
+Cmnd_Alias NN_STATUS   = /usr/bin/ss -tulpn, /usr/bin/ss -tunp, /usr/sbin/ss -tulpn, /usr/sbin/ss -tunp
+%linux-operador ALL=(root) NOEXEC: NN_SERVICOS, NN_STATUS
+
+# linux-leitura: nenhum sudo além do "ss" com nome de processo. Status de serviços
+# (systemctl status), logs (journalctl, grupos adm/systemd-journal dados no login por
+# pam_group) e diagnóstico (ping, traceroute, mtr, dig, ip, ss) funcionam sem root.
+%linux-leitura ALL=(root) NOEXEC: NN_STATUS

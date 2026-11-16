@@ -1,0 +1,12 @@
+# VPN do NOC (WireGuard): arquivo de quem conecta. Modelo; ver docs/wireguard.md.
+[Interface]
+# Gerada no próprio dispositivo; a privada nunca sai dele.
+PrivateKey = <CHAVE_PRIVADA_DO_DISPOSITIVO>
+Address = 10.99.99.11/32
+
+[Peer]
+PublicKey = <CHAVE_PUBLICA_DO_CONCENTRADOR>
+Endpoint = vpn.exemplo.net.br:51820
+# Só as redes de gerência passam pelo túnel; a internet da pessoa segue fora dele.
+AllowedIPs = 10.99.99.0/24, 100.65.0.0/16, 100.66.0.0/16, 172.16.0.0/12
+PersistentKeepalive = 25

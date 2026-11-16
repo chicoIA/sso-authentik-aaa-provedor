@@ -1,0 +1,17 @@
+{% extends "base.html" %}{% from "_macros.html" import res, tabela_eventos %}
+{% block corpo %}<h1>Visão geral</h1>
+<p class="tabs"><a class="{{ 'at' if periodo=='24h' }}" href="?periodo=24h">Últimas 24 h</a><a class="{{ 'at' if periodo=='7d' }}" href="?periodo=7d">Últimos 7 dias</a>
+<span class="mut">Última ingestão: {{ ultimo|ts if ultimo else 'nenhuma' }}</span></p>
+{% for nome, rot in (('24h','Últimas 24 horas'),('7d','Últimos 7 dias')) %}{% set c = cont[nome] %}
+<h2>{{ rot }}</h2><div class="cards">
+<div class="card"><div class="n ok">{{ c.login_ok }}</div><div class="l">logins permitidos</div></div>
+<div class="card"><div class="n err">{{ c.login_neg }}</div><div class="l">logins negados</div></div>
+<div class="card"><div class="n ok">{{ c.cmd_ok }}</div><div class="l">comandos autorizados</div></div>
+<div class="card"><div class="n err">{{ c.cmd_neg }}</div><div class="l">comandos negados</div></div>
+<div class="card"><div class="n">{{ c.acct }}</div><div class="l">registros de accounting</div></div></div>{% endfor %}
+<div class="grid2"><div><h2>Top usuários ({{ periodo }})</h2><div class="tw"><table><tr><th>Usuário</th><th>Eventos</th><th>Negados</th></tr>
+{% for r in top_u %}<tr><td><a href="{{ url_for('pagina_usuario', nome=r.usuario) }}">{{ r.usuario }}</a></td><td>{{ r.n }}</td><td class="{{ 'err' if r.neg }}">{{ r.neg }}</td></tr>{% else %}<tr><td colspan="3" class="mut">Sem dados.</td></tr>{% endfor %}</table></div></div>
+<div><h2>Top equipamentos ({{ periodo }})</h2><div class="tw"><table><tr><th>Equipamento</th><th>Eventos</th><th>Negados</th></tr>
+{% for r in top_n %}<tr><td><a href="{{ url_for('pagina_equipamento', ip=r.nas_ip) }}">{{ r.nas_ip }}</a></td><td>{{ r.n }}</td><td class="{{ 'err' if r.neg }}">{{ r.neg }}</td></tr>{% else %}<tr><td colspan="3" class="mut">Sem dados.</td></tr>{% endfor %}</table></div></div></div>
+<h2>Últimas falhas ({{ periodo }})</h2>{{ tabela_eventos(falhas) }}
+{% endblock %}

@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# OPCIONAL: segundo fator no login dos equipamentos (SSH por TACACS+ e RADIUS).
+# Não é aplicado sozinho. Para ligar (passo a passo e cuidados: docs/ssh-2fa.md):
+#   1. copie este arquivo para apps/authentik/blueprints/;
+#   2. ponha mfa_support: true no provider LDAP (apps/ldap/blueprints/03-ldap.yaml)
+#      e/ou no provider RADIUS (apps/radius/blueprints/02-radius-equipamentos.yaml);
+#   3. reaplique os blueprints (sudo ./provedor up authentik) e teste com uma conta.
+#
+# Efeito: quem tem TOTP (ou código estático) passa a digitar "senha;123456" no campo
+# de senha do equipamento. Quem não tem autenticador segue só com a senha enquanto
+# not_configured_action for "skip"; troque para "deny" no estágio provedor-radius-mfa
+# (01-fluxo-autenticacao.yaml) para recusar quem não cadastrou.
+version: 1
+metadata:
+  name: Exemplo - MFA nos equipamentos (opcional)
+  labels:
+    blueprints.goauthentik.io/description: Liga a etapa de MFA no fluxo dos outposts RADIUS e LDAP
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        path: provedor/authentik/01-fluxo-autenticacao.yaml
+      required: true
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, provedor-radius-autenticacao]]
+      stage: !Find [authentik_stages_authenticator_validate.authenticatorvalidatestage, [name, provedor-radius-mfa]]
+      order: 30

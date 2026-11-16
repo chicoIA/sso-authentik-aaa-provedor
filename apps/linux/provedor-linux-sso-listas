@@ -1,0 +1,130 @@
+#!/bin/bash
+# Grupos "por lista" do login Linux pelo SSO (docs/linux-sso.md), no padrão do TACACS+:
+#   linux-admin-or-hosts-operador    admin em todos os servidores, operador nos da lista
+#   linux-leitura-or-hosts-operador  leitura em todos os servidores, operador nos da lista
+# A lista fica no próprio grupo, no authentik (atributo linux_operador_em, uma linha
+# "IP: nome" por servidor; vale qualquer IP do servidor ou o hostname). Este script
+# (timer a cada 5 min, instalado pelo provedor-linux-sso) lê as listas pelo LDAP, vê se
+# este servidor está em cada uma e grava /etc/sudoers.d/provedor-sso-listas.
+#
+#   provedor-linux-sso-listas          aplica (é o que o timer roda)
+#   provedor-linux-sso-listas status   mostra a decisão sem gravar
+#
+# LDAP sem resposta: mantém o arquivo atual; se ainda não existir, grava o mais restrito
+# (operador para admin-or, leitura para leitura-or).
+set -uo pipefail
+NOME=ldap-sso.provedor.interno
+BASE="dc=ldap,dc=provedor,dc=com,dc=br"
+BIND="cn=linux-servico,ou=users,$BASE"
+CA=/etc/ssl/provedor/ldap-sso.crt
+ARQ=/etc/sudoers.d/provedor-sso-listas
+G_ADMIN=linux-admin-or-hosts-operador
+G_LEITURA=linux-leitura-or-hosts-operador
+MODO="${1:-aplicar}"
+
+[ "$(id -u)" = 0 ] || { echo "rodar como root" >&2; exit 1; }
+
+log() { logger -t provedor-linux-sso-listas -- "$*"; [ -t 1 ] && echo "$*"; return 0; }
+
+# Nomes e IPs deste servidor, em minúsculas
+eu() { { hostname -s; hostname -f 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\n'; } \
+       | sed '/^$/d' | tr 'A-Z' 'a-z' | sort -u; }
+
+# Saída: "grupo<TAB>chave" por servidor listado, e "grupo<TAB>" para cada grupo achado
+consulta() {
+    local senha saida
+    senha=$(sed -n 's/^ldap_default_authtok = //p' /etc/sssd/sssd.conf 2>/dev/null)
+    [ -n "$senha" ] || return 3
+    saida=$(LDAPTLS_CACERT="$CA" timeout 20 ldapsearch -LLL -o ldif-wrap=no -x -H "ldaps://$NOME" \
+        -D "$BIND" -y <(printf %s "$senha") -b "ou=groups,$BASE" \
+        "(|(cn=$G_ADMIN)(cn=$G_LEITURA))" linux_operador_em) || return 2
+    local g="" l v
+    while IFS= read -r l; do
+        case "$l" in
+            dn:\ cn=*) g=${l#dn: cn=}; g=${g%%,*}; printf '%s\t\n' "$g" ;;
+            linux_operador_em::\ *) v=$(printf %s "${l#*:: }" | base64 -d 2>/dev/null) ;;
+            linux_operador_em:\ *) v=${l#*: } ;;
+            *) continue ;;
+        esac
+        case "$l" in linux_operador_em*) ;; *) continue ;; esac
+        if [ "${v#map[}" != "$v" ]; then
+            # dicionário (como o TACACS+): map[172.16.20.10:srv-a 10.0.0.5:srv-b]
+            v=${v#map[}; v=${v%]}
+            for t in $v; do case "$t" in *:*) printf '%s\t%s\n' "$g" "${t%%:*}" ;; esac; done
+        else
+            # lista: "172.16.20.10: srv-a" ou só "172.16.20.10"
+            v=${v%%:*}; v=$(printf %s "$v" | tr -d ' ')
+            [ -n "$v" ] && printf '%s\t%s\n' "$g" "$v"
+        fi
+    done <<< "$saida"
+}
+
+na_lista() { # $1 grupo; usa $LISTAS e $EU
+    printf '%s\n' "$LISTAS" | awk -F'\t' -v g="$1" '$1==g && $2!="" {print tolower($2)}' \
+        | grep -qxF -f <(printf '%s\n' "$EU")
+}
+
+gera() { # $1 admin-or na lista (1/0), $2 leitura-or na lista (1/0), $3 origem
+    cat <<EOF
+# /etc/sudoers.d/provedor-sso-listas: gerado por provedor-linux-sso-listas ($3). Não editar:
+# as listas ficam no authentik (atributo linux_operador_em dos grupos).
+Cmnd_Alias NNL_SERVICOS = /usr/bin/systemctl start *, /usr/bin/systemctl stop *, \\
+                          /usr/bin/systemctl restart *, /usr/bin/systemctl reload *, \\
+                          /usr/bin/systemctl try-restart *, \\
+                          /usr/bin/docker start *, /usr/bin/docker stop *, /usr/bin/docker restart *, \\
+                          /usr/bin/docker ps, /usr/bin/docker ps *, /usr/bin/docker logs *
+Cmnd_Alias NNL_STATUS   = /usr/bin/ss -tulpn, /usr/bin/ss -tunp, /usr/sbin/ss -tulpn, /usr/sbin/ss -tunp
+EOF
+    if [ "$1" = 1 ]; then
+        echo "# $G_ADMIN: este servidor está na lista -> operador"
+        echo "%$G_ADMIN ALL=(root) NOEXEC: NNL_SERVICOS, NNL_STATUS"
+    else
+        echo "# $G_ADMIN: fora da lista -> admin"
+        echo "%$G_ADMIN ALL=(ALL:ALL) ALL"
+    fi
+    if [ "$2" = 1 ]; then
+        echo "# $G_LEITURA: este servidor está na lista -> operador"
+        echo "%$G_LEITURA ALL=(root) NOEXEC: NNL_SERVICOS, NNL_STATUS"
+    else
+        echo "# $G_LEITURA: fora da lista -> leitura"
+        echo "%$G_LEITURA ALL=(root) NOEXEC: NNL_STATUS"
+    fi
+}
+
+EU=$(eu)
+LISTAS=$(consulta); rc=$?
+# Os dois grupos têm de vir na resposta: resposta incompleta conta como falha
+# (evita virar admin por uma lista que "sumiu").
+if [ $rc -eq 0 ]; then
+    for g in "$G_ADMIN" "$G_LEITURA"; do
+        printf '%s\n' "$LISTAS" | grep -q "^$g"$'\t' || rc=4
+    done
+fi
+
+if [ $rc -ne 0 ]; then
+    if [ "$MODO" = status ]; then echo "LDAP: falha (código $rc; 3 = sem senha no sssd.conf, 4 = grupos não encontrados)"; exit 1; fi
+    if [ -f "$ARQ" ]; then log "LDAP sem resposta completa (código $rc): mantido $ARQ"; exit 1; fi
+    A=1; L=0; ORIGEM="padrão restrito, LDAP sem resposta"
+else
+    A=0; L=0
+    na_lista "$G_ADMIN" && A=1
+    na_lista "$G_LEITURA" && L=1
+    ORIGEM="LDAP"
+fi
+
+if [ "$MODO" = status ]; then
+    echo "Este servidor: $(printf '%s ' $EU)"
+    printf '%s\n' "$LISTAS" | awk -F'\t' '$2!="" {print "  lista de " $1 ": " $2}'
+    [ $A = 1 ] && echo "$G_ADMIN -> OPERADOR aqui" || echo "$G_ADMIN -> ADMIN aqui"
+    [ $L = 1 ] && echo "$G_LEITURA -> OPERADOR aqui" || echo "$G_LEITURA -> LEITURA aqui"
+    if [ -f "$ARQ" ]; then echo "Em vigor:"; grep '^%' "$ARQ" | sed 's/^/  /'; else echo "Em vigor: (arquivo ainda não gravado)"; fi
+    exit 0
+fi
+
+NOVO="$ARQ.novo"   # nome com ponto: o sudo ignora até ser renomeado
+gera "$A" "$L" "$ORIGEM" > "$NOVO"; chmod 440 "$NOVO"
+if ! visudo -cf "$NOVO" >/dev/null 2>&1; then rm -f "$NOVO"; log "ERRO: sudoers gerado inválido; nada mudou"; exit 1; fi
+if [ -f "$ARQ" ] && cmp -s <(grep '^%' "$NOVO") <(grep '^%' "$ARQ"); then rm -f "$NOVO"; exit 0; fi
+mv "$NOVO" "$ARQ"
+log "aplicado ($ORIGEM): $G_ADMIN=$([ $A = 1 ] && echo operador || echo admin), $G_LEITURA=$([ $L = 1 ] && echo operador || echo leitura)"
+[ "$ORIGEM" = LDAP ] || exit 1

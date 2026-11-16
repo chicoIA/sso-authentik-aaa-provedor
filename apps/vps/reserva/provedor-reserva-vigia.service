@@ -1,0 +1,15 @@
+# Vigia da reserva: sonda o RADIUS da VM e ativa a reserva se ela
+# ficar 5 min sem responder (só com /etc/provedor-reserva/automatico).
+# Fonte: apps/vps/reserva/ no git.
+[Unit]
+Description=Vigia da reserva RADIUS/SSO Exemplo
+After=docker.service frr.service network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/provedor-reserva vigia
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

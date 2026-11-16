@@ -1,0 +1,23 @@
+# App ldap: outpost LDAP do authentik (base para TACACS+ e sistemas que só falam LDAP).
+# Não suba direto: use ./provedor up ldap
+services:
+  ldap-outpost:
+    image: ghcr.io/goauthentik/ldap:${AUTHENTIK_TAG:-2026.8.3}
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_LDAP_TOKEN:?preencha AUTHENTIK_LDAP_TOKEN no .env}
+      AUTHENTIK_LISTEN__LDAP: "[::]:3389"
+      AUTHENTIK_LISTEN__LDAPS: "[::]:6636"
+    ports:
+      - "389:3389"
+      - "636:6636"
+    networks:
+      - provedor
+
+networks:
+  provedor:
+    external: true
+    name: provedor

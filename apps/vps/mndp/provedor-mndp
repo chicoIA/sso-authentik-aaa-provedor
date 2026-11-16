@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+"""Anuncia a VPS por MNDP (descoberta de vizinhos MikroTik) nos túneis wg-*.
+
+Os roteadores mandam MNDP pelos túneis e esperam o mesmo de volta; com isto a
+VPS aparece em /ip neighbor de cada roteador. Só envia (a cada 30 s), não lê
+nada: o MNDP que chega dos roteadores é descartado no firewall sem log.
+Formato: cabeçalho de 4 bytes (2 livres + sequência) e TLVs tipo/tamanho
+(16 bits, big-endian); o uptime vai em 32 bits little-endian.
+"""
+import fcntl
+import glob
+import os
+import socket
+import struct
+import time
+
+PORTA = 5678
+INTERVALO = 30
+IDENTIDADE = "VPS-RESERVA"
+INICIO = time.monotonic()
+
+
+def tlv(tipo, valor):
+    return struct.pack(">HH", tipo, len(valor)) + valor
+
+
+def ipv4_da_interface(nome):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        req = struct.pack("256s", nome.encode()[:15])
+        return fcntl.ioctl(s.fileno(), 0x8915, req)[20:24]  # SIOCGIFADDR
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def pacote(seq, interface, ip):
+    uptime = int(time.monotonic() - INICIO)
+    corpo = b"".join([
+        tlv(1, b"\x00" * 6),                       # MAC (túnel não tem)
+        tlv(5, IDENTIDADE.encode()),
+        tlv(7, b"FRR / Debian " + open("/etc/debian_version").read().strip().encode()),
+        tlv(8, b"Linux"),
+        tlv(10, struct.pack("<I", uptime)),
+        tlv(12, b"VPS"),
+        tlv(16, interface.encode()),
+        tlv(17, ip),
+    ])
+    return struct.pack(">HH", 0, seq & 0xFFFF) + corpo
+
+
+def main():
+    seq = 0
+    while True:
+        for caminho in sorted(glob.glob("/sys/class/net/wg-*")):
+            nome = os.path.basename(caminho)
+            ip = ipv4_da_interface(nome)
+            if ip is None:
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, nome.encode())
+                s.bind(("0.0.0.0", PORTA))
+                s.sendto(pacote(seq, nome, ip), ("255.255.255.255", PORTA))
+            except OSError as erro:
+                print(f"{nome}: {erro}", flush=True)
+            finally:
+                s.close()
+        seq += 1
+        time.sleep(INTERVALO)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,240 @@
+# Pilha reserva na VPS VPS-RESERVA. Destino: /opt/provedor-reserva/
+# na VPS, com .env próprio (PG_REPLICA_PASS; não vai para o git).
+#
+# reserva-postgres: réplica em streaming (só leitura) do Postgres do authentik
+# da VM, pelo túnel (172.16.7.10:5432, usuário replicador, slot vps_reserva).
+# A VM limita o WAL retido no slot a 2 GB: se a VPS ficar fora por muito
+# tempo, a réplica perde a sequência e precisa de novo pg_basebackup.
+# Mesma versão da VM (16.15): réplica física exige o mesmo major.
+#
+# Primeira carga (volume vazio; NÃO subir o serviço antes, senão o entrypoint
+# cria um banco novo vazio): ver apps/vps/reserva/README.md.
+name: provedor-reserva
+
+services:
+  reserva-postgres:
+    image: docker.io/library/postgres:16.15-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60", "-c", "hot_standby=on"]
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pg-reserva:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U authentik -d authentik"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [reserva]
+
+  # reserva-mariadb: cópia das 6 tabelas que o FreeRADIUS LÊ (nas, radcheck,
+  # radreply, radgroupcheck, radgroupreply, radusergroup), enviada pela VM a
+  # cada 5 min (provedor-envia-radius -> ssh -> provedor-recebe-radius).
+  # radacct/radpostauth só com a estrutura: na reserva a contabilidade fica
+  # aqui e é reenviada à VM na volta. Mesma versão da VM (10.11.18).
+  reserva-mariadb:
+    image: docker.io/library/mariadb:10.11.18
+    restart: unless-stopped
+    mem_limit: 256m
+    command: ["--innodb-buffer-pool-size=32M", "--max-connections=60", "--skip-name-resolve"]
+    environment:
+      MARIADB_ROOT_PASSWORD: ${RESERVA_DB_ROOT_PASS:?defina no .env}
+      MARIADB_DATABASE: radius
+      MARIADB_USER: radius
+      MARIADB_PASSWORD: ${RESERVA_DB_PASS:?defina no .env}
+    volumes:
+      - mariadb-reserva:/var/lib/mysql
+      # socket para o FreeRADIUS da reserva (rede do host, como na VM)
+      - mariadb-socket:/run/mysqld
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [reserva]
+
+  # ---- Pilha de atendimento: só sobe na ATIVAÇÃO (perfil "ativa") ----------
+  # Em produção usa a réplica promovida (reserva-postgres). No teste,
+  # RESERVA_PG_HOST=reserva-pg-teste (clone descartável, perfil "teste").
+  # Sem os blueprints provedor: eles leem segredos por !Env e, aplicados aqui
+  # sem esses valores, estragariam configuração no banco.
+  reserva-authentik-server:
+    image: ghcr.io/goauthentik/server:2026.8.3
+    profiles: [ativa]
+    command: server
+    restart: unless-stopped
+    mem_limit: 768m
+    environment: &ak-env
+      AUTHENTIK_POSTGRESQL__HOST: ${RESERVA_PG_HOST:-reserva-postgres}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?defina no .env}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?defina no .env}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_WEB__WORKERS: "1"
+      AUTHENTIK_WEB__THREADS: "2"
+      AUTHENTIK_WORKER__PROCESSES: "1"
+      AUTHENTIK_WORKER__THREADS: "2"
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    # Marca (logo etc.): cópia de apps/authentik/data/media da VM.
+    volumes:
+      - ./media:/media
+    # caddy: rede do Caddy (proxy_default, apps/vps/caddy/compose.yml) para o sso. apontar para cá
+    # na ativação (sso-destino.caddy, trocado por provedor-reserva).
+    networks: [reserva, caddy]
+
+  reserva-authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.8.3
+    profiles: [ativa]
+    command: worker
+    restart: unless-stopped
+    mem_limit: 640m
+    environment: *ak-env
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    volumes:
+      - ./media:/media
+    networks: [reserva]
+
+  reserva-radius-outpost:
+    image: ghcr.io/goauthentik/radius:2026.8.3
+    profiles: [ativa]
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      AUTHENTIK_HOST: http://reserva-authentik-server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_RADIUS_TOKEN:?defina no .env}
+      AUTHENTIK_LISTEN__RADIUS: "0.0.0.0:1812"
+      AUTHENTIK_LISTEN__METRICS: "0.0.0.0:9300"
+    ports:
+      - 127.0.0.1:18120:1812/udp
+    networks: [reserva]
+
+  # Mesma imagem da VM (copiada com docker save/load). Rede do host: na
+  # ativação atende no .196 (radius0). Portas: 11812/11813 no teste (fechadas
+  # no firewall da VPS); 1812/1813 na ativação (RESERVA_FR_PORTA_*).
+  reserva-freeradius:
+    image: provedor/freeradius:3.2.10
+    profiles: [ativa]
+    restart: unless-stopped
+    mem_limit: 192m
+    network_mode: host
+    environment:
+      TZ: America/Sao_Paulo
+      AUTHENTIK_OUTPOST_IP: 127.0.0.1
+      OUTPOST_RADIUS_PORTA: "18120"
+      AUTHENTIK_RADIUS_SECRET: ${AUTHENTIK_RADIUS_SECRET:?defina no .env}
+      FR_SEGREDO_LOCAL: ${FR_SEGREDO_LOCAL:?defina no .env}
+      FR_PORTA_AUTH: ${RESERVA_FR_PORTA_AUTH:-11812}
+      FR_PORTA_ACCT: ${RESERVA_FR_PORTA_ACCT:-11813}
+      FR_CACHE_TTL: ${FR_CACHE_TTL:-300}
+      FR_CACHE_RESERVA_TTL: ${FR_CACHE_RESERVA_TTL:-1728000}
+      FR_CACHE_TRAVA_TTL: ${FR_CACHE_TRAVA_TTL:-25}
+      FR_PORTA_REVALIDA: "18121"
+      FR_CHAP_LEGADO: ${FR_CHAP_LEGADO:-sim}
+      FR_GRAVAR_SQL: "sim"
+      FR_ACCT_IGNORAR_USUARIOS: ${FR_ACCT_IGNORAR_USUARIOS-zabbix zabbix@exemplo.net.br}
+      FR_EXIGIR_MSGAUTH: ${FR_EXIGIR_MSGAUTH:-no}
+      DALO_DB_USER: radius
+      DALO_DB_PASS: ${RESERVA_DB_PASS:?defina no .env}
+      DALO_DB_NAME: radius
+    volumes:
+      - mariadb-socket:/run/mysqld:ro
+
+  # LDAP (TACACS+ e sistemas que só falam LDAP). Porta presa ao .196: só sobe
+  # depois da radius0 (provedor-reserva ativa); antes disso o bind falha.
+  reserva-ldap-outpost:
+    image: ghcr.io/goauthentik/ldap:2026.8.3
+    profiles: [ativa]
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      AUTHENTIK_HOST: http://reserva-authentik-server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_LDAP_TOKEN:?defina no .env}
+      AUTHENTIK_LISTEN__LDAP: "0.0.0.0:3389"
+      AUTHENTIK_LISTEN__LDAPS: "0.0.0.0:6636"
+    ports:
+      - 100.66.80.196:389:3389
+      - 100.66.80.196:636:6636
+    networks: [reserva]
+
+  # TACACS+ (mesma imagem e configuração da VM: docker save/load de
+  # provedor-tacacs:local; ao mudar apps/tacacs, copiar a imagem de novo).
+  # Autentica no LDAP da reserva. Porta presa ao .196, como o LDAP: sobe
+  # depois da radius0.
+  reserva-tacacs:
+    image: provedor-tacacs:local
+    profiles: [ativa]
+    init: true
+    restart: unless-stopped
+    mem_limit: 192m  # igual à VM
+    environment:
+      TACACS_KEY: ${TACACS_KEY:?defina no .env}
+      LDAP_SERVICO_SENHA: ${LDAP_SERVICO_SENHA:?defina no .env}
+      TACACS_LDAP_BASE_DN: ${AUTHENTIK_LDAP_BASE_DN:-dc=ldap,dc=provedor,dc=com,dc=br}
+      TACACS_LDAP_URL: ldap://reserva-ldap-outpost:3389
+      TZ: America/Sao_Paulo
+    ports:
+      - 100.66.80.196:49:4949
+    volumes:
+      - tacacs-logs:/var/log/tacacs
+      # Conjuntos de equipamentos: copiados da VM pelo provedor-tacacs-conjuntos.
+      - /etc/provedor-tacacs:/etc/tacacs/conjuntos:ro
+    tmpfs:
+      - /run/tacacs:mode=0755
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    networks: [reserva]
+
+  # ---- Só para o teste (perfil "teste") ---------------------------
+  # Clone descartável da réplica: copiado com a réplica parada e promovido à
+  # mão (pg_promote). primary_conninfo vazio: nunca conecta na VM.
+  reserva-pg-teste:
+    image: docker.io/library/postgres:16.15-alpine
+    profiles: [teste]
+    restart: "no"
+    mem_limit: 256m
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60", "-c", "primary_conninfo=", "-c", "primary_slot_name="]
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pg-teste:/var/lib/postgresql/data
+    networks: [reserva]
+
+volumes:
+  tacacs-logs:
+  pg-reserva:
+  mariadb-reserva:
+  mariadb-socket:
+  pg-teste:
+
+networks:
+  caddy:
+    external: true
+    name: proxy_default
+  reserva:
+    enable_ipv6: false
+    ipam:
+      config:
+        # Mesma faixa da rede Docker da VM: o provider RADIUS do authentik só
+        # aceita o outpost vindo de 10.233.0.0/16 ou 127.0.0.1 (client_networks),
+        # e a réplica traz essa configuração da VM.
+        - subnet: 10.233.10.0/24

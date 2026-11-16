@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Provider LDAP (base para TACACS+ e sistemas que só falam LDAP).
+# Aplicado automaticamente. Depende de provedor/authentik/01-fluxo-autenticacao.yaml.
+#
+# Base DN: dc=ldap,dc=provedor,dc=com,dc=br
+# Usuários: ou=users,<base DN> (cn=<username>)   Grupos: ou=groups,<base DN>
+# Os grupos tacacs-* são vinculados à aplicação pelo app tacacs.
+version: 1
+metadata:
+  name: Exemplo - LDAP
+  labels:
+    blueprints.goauthentik.io/description: Provider LDAP para TACACS+ e sistemas internos
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        path: provedor/authentik/01-fluxo-autenticacao.yaml
+      required: true
+
+  - model: authentik_core.group
+    id: grupo-acesso
+    identifiers:
+      name: ldap-acesso
+    attrs:
+      attributes:
+        descricao: Membros podem fazer bind no LDAP (sistemas e conta de serviço)
+
+  # Conta de serviço: faz bind e pesquisa todo o diretório. A senha vem de
+  # LDAP_SERVICO_SENHA (variável do worker). A permissão global
+  # search_full_directory é concedida pelo campo "permissions" (só em blueprint).
+  - model: authentik_core.user
+    id: conta-servico
+    identifiers:
+      username: ldap-servico
+    attrs:
+      name: Conta de serviço LDAP
+      type: service_account
+      path: provedor/servicos
+      password: !Env LDAP_SERVICO_SENHA
+      permissions:
+        - authentik_providers_ldap.search_full_directory
+      groups:
+        - !KeyOf grupo-acesso
+
+  - model: authentik_providers_ldap.ldapprovider
+    id: provider
+    identifiers:
+      name: provedor-ldap
+    attrs:
+      authorization_flow: !Find [authentik_flows.flow, [slug, provedor-radius-autenticacao]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      base_dn: !Env [AUTHENTIK_LDAP_BASE_DN, "dc=ldap,dc=provedor,dc=com,dc=br"]
+      # direct: usuário novo no authentik aparece na hora (TACACS+ e sistemas
+      # buscam o usuário antes do bind); o volume de buscas é baixo.
+      search_mode: direct
+      bind_mode: cached
+      mfa_support: false
+      # Certificado da porta 636 (ldaps), gerado no authentik (Sistema > Certificados), validade
+      # longa, nome ldap-sso.provedor.interno (os servidores Linux resolvem esse nome
+      # pelo /etc/hosts e confiam nele: docs/linux-sso.md). A 389 (TACACS+) não muda.
+      certificate: !Find [authentik_crypto.certificatekeypair, [name, ldap-sso.provedor.interno]]
+
+  - model: authentik_core.application
+    id: aplicacao
+    identifiers:
+      slug: provedor-ldap
+    attrs:
+      name: Diretório LDAP
+      provider: !KeyOf provider
+      meta_description: TACACS+ e sistemas internos via LDAP
+      policy_engine_mode: any
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf aplicacao
+      group: !KeyOf grupo-acesso
+      order: 0
+
+  - model: authentik_outposts.outpost
+    identifiers:
+      name: provedor-ldap
+    attrs:
+      type: ldap
+      # Implantação manual (container "ldap-outpost" em apps/ldap/compose.yml).
+      service_connection: null
+      providers:
+        - !KeyOf provider
+      config:
+        authentik_host: !Env [AUTHENTIK_URL_EXTERNA, "http://authentik-server:9000"]
+        log_level: info

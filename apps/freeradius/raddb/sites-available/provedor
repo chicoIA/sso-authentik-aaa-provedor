@@ -1,0 +1,195 @@
+#  Exemplo: equipamentos -> FreeRADIUS -> authentik
+#
+#  - PAP: encaminhado (proxy) ao outpost RADIUS do authentik, com cache curto
+#    (rlm_cache) dos Access-Accept. O authentik decide quem entra (grupo
+#    radius-equipamentos) e quais atributos voltam.
+#  - CHAP/MS-CHAP/EAP: modo legado pelo SQL do daloRADIUS (FR_CHAP_LEGADO=sim).
+#  - authentik fora do ar: o FreeRADIUS NÃO responde, para o equipamento usar o
+#    usuário local de emergência.
+#  - Accounting/post-auth: só log (FR_GRAVAR_SQL=nao, teste) ou radacct e
+#    radpostauth (FR_GRAVAR_SQL=sim, produção).
+#
+#  O servidor virtual se chama "default" de propósito: se a coluna "server" da
+#  tabela nas citar "default" (como no FreeRADIUS do sistema), os clientes
+#  continuam funcionando sem alterar o cadastro NAS.
+
+server default {
+
+#  Portas configuráveis (FR_PORTA_AUTH / FR_PORTA_ACCT): 11812/11813 para testar ao
+#  lado do FreeRADIUS do sistema; 1812/1813 depois da virada. IPv4 e IPv6.
+listen {
+	type = auth
+	ipaddr = *
+	port = $ENV{FR_PORTA_AUTH}
+	limit {
+		max_connections = 16
+		lifetime = 0
+		idle_timeout = 30
+	}
+}
+
+listen {
+	type = acct
+	ipaddr = *
+	port = $ENV{FR_PORTA_ACCT}
+}
+
+listen {
+	type = auth
+	ipv6addr = ::
+	port = $ENV{FR_PORTA_AUTH}
+	limit {
+		max_connections = 16
+		lifetime = 0
+		idle_timeout = 30
+	}
+}
+
+listen {
+	type = acct
+	ipv6addr = ::
+	port = $ENV{FR_PORTA_ACCT}
+}
+
+authorize {
+	#  Healthcheck do container (radclient ... status).
+	Autz-Type Status-Server {
+		ok
+	}
+
+	#  Usuários com "@" são literais: não há realm/suffix aqui.
+	filter_username
+	preprocess
+	provedor_classificar
+
+	if (&control:Tmp-String-1 == "pap") {
+		provedor_pap
+	}
+	else {
+		provedor_nao_pap
+	}
+}
+
+authenticate {
+	#  Só chega aqui se não houver outpost vivo para encaminhar.
+	Auth-Type Sem-Authentik {
+		provedor_authentik_fora
+	}
+
+	#  Modo legado (CHAP/MS-CHAP pelo SQL).
+	Auth-Type PAP {
+		pap
+	}
+	Auth-Type CHAP {
+		chap
+	}
+	Auth-Type MS-CHAP {
+		mschap
+	}
+	mschap
+	eap
+}
+
+preacct {
+	preprocess
+	acct_unique
+}
+
+accounting {
+	#  Usuários de monitoramento (FR_ACCT_IGNORAR_USUARIOS, padrão "zabbix"):
+	#  respondem o Accounting-Response, mas não vão para o radacct nem para o log.
+	if (("$ENV{FR_ACCT_IGNORAR_ATIVO}" == "sim") && (&User-Name =~ /^($ENV{FR_ACCT_IGNORAR_REGEX})$/)) {
+		ok
+	}
+	elsif ("$ENV{FR_GRAVAR_SQL}" == "sim") {
+		sql
+	}
+	else {
+		provedor_log_acct
+	}
+	attr_filter.accounting_response
+}
+
+session {
+}
+
+post-auth {
+	provedor_usar_reserva
+	provedor_log_auth
+	provedor_pos_auth_sql
+
+	Post-Auth-Type REJECT {
+		provedor_log_auth
+		provedor_pos_auth_sql
+		attr_filter.access_reject
+	}
+}
+
+pre-proxy {
+}
+
+post-proxy {
+	#  O outpost não respondeu dentro do response_window.
+	Post-Proxy-Type Fail-Authentication {
+		provedor_authentik_fora
+	}
+
+	#  A resposta chegou: o Auth-Type de contingência não vale mais (evita o
+	#  aviso "Found 2 auth-types" quando o FreeRADIUS marca Accept/Reject).
+	update control {
+		&Auth-Type !* ANY
+	}
+	provedor_gravar_caches
+}
+
+}
+
+#
+#  Revalidação em segundo plano: recebe (só em 127.0.0.1) a cópia enviada pelo
+#  módulo replicate quando um pedido foi respondido pela reserva, consulta o
+#  authentik e atualiza/apaga os caches. A resposta vai para o replicate, que
+#  a ignora; o equipamento já foi respondido.
+#
+server revalidar {
+
+listen {
+	type = auth
+	ipaddr = 127.0.0.1
+	port = $ENV{FR_PORTA_REVALIDA}
+}
+
+authorize {
+	update control {
+		&Proxy-To-Realm := "AUTHENTIK_EQUIPAMENTOS"
+		&Tmp-String-0 := "revalidacao"
+		&Tmp-String-1 := "pap"
+		&Auth-Type := Sem-Authentik
+	}
+}
+
+authenticate {
+	Auth-Type Sem-Authentik {
+		provedor_liberar_trava
+		do_not_respond
+	}
+}
+
+post-proxy {
+	Post-Proxy-Type Fail-Authentication {
+		provedor_liberar_trava
+		do_not_respond
+	}
+	update control {
+		&Auth-Type !* ANY
+	}
+	provedor_gravar_caches
+}
+
+post-auth {
+	provedor_log_auth
+	Post-Auth-Type REJECT {
+		provedor_log_auth
+	}
+}
+
+}

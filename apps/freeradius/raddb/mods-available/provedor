@@ -1,0 +1,111 @@
+#  Módulos da Exemplo: cache de autenticação (PAP) e logs em stdout.
+
+#
+#  Cache de autenticação PAP em duas camadas + trava (rlm_cache, em memória).
+#  Chave = SHA-256(segredo-do-outpost | usuário | senha): a senha nunca fica
+#  guardada, nem em memória, e o hash só vale dentro deste processo/segredo.
+#  Guarda os atributos de resposta (Mikrotik-Group, Huawei-Exec-Privilege...).
+#
+#  Por quê: cada verificação de senha custa ~1,5 s de CPU no authentik
+#  (PBKDF2), e o zabbix faz rajadas de centenas de logins no mesmo segundo.
+#
+#  - provedor_cache (fresco, FR_CACHE_TTL=300 s): responde direto.
+#  - provedor_cache_reserva (FR_CACHE_RESERVA_TTL=1728000 s, 20 dias): o par
+#    usuário+senha foi aceito pelo authentik. Quando o fresco expira, o pedido
+#    é respondido NA HORA pela reserva (Mikrotik usa timeout de 300 ms) e uma
+#    cópia vai em segundo plano ao servidor "revalidar" (uma por trava). Se o authentik recusar (usuário desativado,
+#    senha trocada) a reserva é apagada na hora; se o authentik estiver fora,
+#    a reserva continua valendo até o TTL.
+#  - provedor_cache_trava (FR_CACHE_TRAVA_TTL=25 s, > response_window): marca
+#    que já há uma consulta ao authentik em andamento para esse usuário+senha.
+#
+#  Desativar usuário / trocar senha no authentik vale em até FR_CACHE_TTL
+#  segundos mais UM login (o que dispara a revalidação), ou na hora
+#  reiniciando o container (zera os três caches).
+#
+cache provedor_cache {
+	driver = "rlm_cache_rbtree"
+	key = "%{sha256:$ENV{AUTHENTIK_RADIUS_SECRET}|%{User-Name}|%{User-Password}}"
+	ttl = $ENV{FR_CACHE_TTL}
+	max_entries = 8192
+	add_stats = no
+
+	update {
+		&reply: += &proxy-reply:
+	}
+}
+
+cache provedor_cache_reserva {
+	driver = "rlm_cache_rbtree"
+	key = "%{sha256:$ENV{AUTHENTIK_RADIUS_SECRET}|%{User-Name}|%{User-Password}}"
+	ttl = $ENV{FR_CACHE_RESERVA_TTL}
+	max_entries = 8192
+	add_stats = no
+
+	update {
+		&reply: += &proxy-reply:
+	}
+}
+
+cache provedor_cache_trava {
+	driver = "rlm_cache_rbtree"
+	key = "%{sha256:$ENV{AUTHENTIK_RADIUS_SECRET}|%{User-Name}|%{User-Password}}"
+	ttl = $ENV{FR_CACHE_TRAVA_TTL}
+	max_entries = 8192
+	add_stats = no
+
+	update {
+		&control:Tmp-String-2 := "trava"
+	}
+}
+
+#
+#  Logs (uma linha por evento, em stdout -> "docker compose logs freeradius").
+#  NUNCA incluem senha. nas = IP de origem do pedido.
+#
+linelog provedor_log_auth {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S PROVEDOR-AUTH nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} usuario=%{User-Name} proto=%{%{control:Tmp-String-1}:-?} origem=%{%{control:Tmp-String-0}:-?} resultado=%{%{reply:Packet-Type}:-?}"
+}
+
+linelog provedor_log_legado {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S LEGADO-CHAP usuario=%{User-Name} nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} proto=%{%{control:Tmp-String-1}:-?}"
+}
+
+linelog provedor_log_recusa_legado {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S CHAP-RECUSADO usuario=%{User-Name} nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} proto=%{%{control:Tmp-String-1}:-?} (FR_CHAP_LEGADO=nao; o authentik so aceita PAP)"
+}
+
+linelog provedor_log_sem_resposta {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S PROVEDOR-AUTH nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} usuario=%{User-Name} proto=%{%{control:Tmp-String-1}:-?} origem=%{%{control:Tmp-String-0}:-?} resultado=SEM-RESPOSTA (authentik indisponivel; NAS usara login local)"
+}
+
+linelog provedor_log_acct {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S PROVEDOR-ACCT nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} usuario=%{%{User-Name}:-?} tipo=%{%{Acct-Status-Type}:-?} sessao=%{%{Acct-Session-Id}:-?} gravado=nao"
+}
+
+linelog provedor_log_aguardando {
+	filename = /dev/stdout
+	permissions = 0666
+	format = "%S PROVEDOR-AUTH nas=%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}} usuario=%{User-Name} proto=pap origem=aguardando resultado=SEM-RESPOSTA (primeiro login ainda em andamento no authentik apos ~6 s)"
+}
+
+#
+#  Espera curta (xlat %{provedor_espera:/bin/sleep 0.5}) usada pelos pedidos
+#  da rajada que aguardam a consulta em andamento preencher o cache.
+#
+exec provedor_espera {
+	wait = yes
+	input_pairs = control
+	shell_escape = yes
+	timeout = 2
+}

@@ -1,0 +1,50 @@
+#!/usr/sbin/nft -f
+# Firewall de entrada da VPS. Tabela própria: NÃO usa "flush ruleset"
+# para não apagar as regras do Docker (tabelas ip nat/filter do iptables-nft).
+# Só filtra tráfego destinado ao host; portas publicadas pelo Docker em IPv4
+# passam pelo forward (DNAT) e não são afetadas.
+table inet provedor
+delete table inet provedor
+table inet provedor {
+    set snmp_v4 { type ipv4_addr; elements = { 198.51.100.163, 198.51.100.25 } }
+
+    chain input {
+        type filter hook input priority filter + 10; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+        iif lo accept
+        iifname { "docker0", "br-*", "veth*" } accept
+
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        tcp dport 2222 accept                          # SSH
+        iifname "wg-*" tcp dport 179 accept            # BGP só pelos túneis
+        iifname "wg-*" udp dport { 3784, 3785 } accept # BFD só pelos túneis
+        iifname "wg-*" udp dport 5678 drop             # MNDP dos roteadores: sem log (provedor-mndp só envia)
+        # RADIUS da reserva (FreeRADIUS na rede do host), só pelos túneis e
+        # só para o IP de serviço (existe só com a reserva ativa). O LDAP da reserva
+        # é porta publicada pelo Docker (forward), não passa por aqui.
+        iifname "wg-*" ip daddr 100.66.80.196 udp dport { 1812, 1813 } accept
+        tcp dport { 80, 443 } accept                   # Caddy (IPv6 via docker-proxy)
+        udp dport 443 accept                           # Caddy HTTP/3
+        # WireGuard dos roteadores. Aberto a qualquer origem: o roteador pode vir por
+        # link de redundância atrás de NAT (IP imprevisível). O WireGuard não responde
+        # a quem não tem a chave, então a porta não aparece em varreduras.
+        udp dport 51821-51829 accept
+        ip saddr @snmp_v4 udp dport 161 accept         # SNMP só do monitoramento
+        ip saddr @snmp_v4 tcp dport 161 accept
+
+        limit rate 10/minute log prefix "provedor-drop: " level info
+    }
+
+    # A VPS não é trânsito entre os túneis e a internet. Containers (Caddy ->
+    # authentik pela rede interna) podem usar os túneis; nada mais.
+    chain forward {
+        type filter hook forward priority filter + 10; policy accept;
+        iifname "wg-*" oifname "eth0" drop
+        iifname "eth0" oifname "wg-*" drop
+        iifname "wg-*" oifname "wg-*" drop
+    }
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Exemplo: listas de equipamentos do authentik para o TACACS+ (VM e reserva)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provedor-tacacs-conjuntos
+TimeoutStartSec=300

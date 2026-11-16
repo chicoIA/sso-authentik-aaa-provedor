@@ -1,0 +1,92 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+# Marca no brand padrão e na tela de login web. Passo a passo para trocar logo,
+# cores, fundo e textos: docs/pagina-de-login.md.
+#
+# Imagens: apps/authentik/marca/ (no git) -> copiar para
+# apps/authentik/data/media/public/provedor/ (dono 1000:1000); os campos abaixo
+# usam o nome relativo à mídia ("provedor/logo.svg").
+# Cores de exemplo: azul #1f6feb, azul-escuro #0f3d6e; título em cinza #727274.
+version: 1
+metadata:
+  name: Exemplo - Marca
+  labels:
+    blueprints.goauthentik.io/description: Marca Exemplo (logo, cores, fundo e título do login)
+entries:
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Brand
+      required: false
+  # Aplica antes o fluxo padrão, para as reaplicações dele não voltarem o título
+  # para "Welcome to authentik!".
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Authentication flow
+      required: false
+
+  - model: authentik_brands.brand
+    identifiers:
+      domain: authentik-default
+    attrs:
+      branding_title: Exemplo
+      branding_logo: provedor/logo.svg
+      branding_favicon: provedor/favicon.svg
+      branding_default_flow_background: provedor/fundo-login.svg
+      attributes:
+        settings:
+          theme:
+            # O site é claro; o cartão de login fica claro também.
+            base: light
+      branding_custom_css: |
+        /* Exemplo: aplicado em todas as telas do authentik. */
+        :root, :host {
+          --pf-global--primary-color--100: #1f6feb;
+          --pf-global--primary-color--200: #0f3d6e;
+          --pf-global--primary-color--300: #0b2a4a;
+          --pf-global--active-color--100: #1f6feb;
+          --pf-global--link--Color: #1f6feb;
+          --pf-global--link--Color--hover: #0f3d6e;
+          --ak-accent: #1f6feb;
+          --pf-global--FontFamily--sans-serif: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+          --pf-global--FontFamily--heading--sans-serif: Archivo, Inter, "Segoe UI", Roboto, Arial, sans-serif;
+          /* Logo maior no painel admin (padrão ~2.25rem; o logo é largo, 335x90). */
+          --ak-c-page-navbar__brand-logo--Height: 3.75rem;
+          /* "Carregando" ao clicar em Conecte-se: véu branco claro em vez do
+             quadro cinza escuro translúcido padrão. */
+          --ak-c-loading-overlay--BackgroundColor: rgba(255, 255, 255, 0.65);
+        }
+        /* Logo maior também na interface do usuário (padrão 2rem). */
+        .pf-c-page__header-brand-link .pf-c-brand {
+          height: 3rem !important;
+          min-height: 3rem !important;
+        }
+        /* Texto da arte de fundo fica à esquerda: não cortar em telas 5:4. */
+        body::before { background-position: left center; }
+        /* Título das telas ("Exemplo — Acesso") no estilo do logo: cinza
+           #727274 em letra pesada, com o traço azul #0f3d6e da faixa do logo. */
+        h1.pf-c-title.pf-m-3xl {
+          font-family: Archivo, "Arial Black", "Helvetica Neue", Arial, sans-serif;
+          font-weight: 800;
+          letter-spacing: -0.02em;
+          color: #727274;
+        }
+        h1.pf-c-title.pf-m-3xl::after {
+          content: "";
+          display: block;
+          width: 3.5rem;
+          height: 0.3rem;
+          margin-top: 0.5rem;
+          border-radius: 0.3rem;
+          background: #0f3d6e;
+        }
+        /* Sem o "Powered by authentik" (sempre o último item do rodapé). */
+        ak-brand-links li[data-kind="text"]:last-child { display: none !important; }
+
+  - model: authentik_flows.flow
+    identifiers:
+      slug: default-authentication-flow
+    attrs:
+      title: Exemplo — Acesso
+      # Cartão de login à direita; a arte (texto à esquerda) aparece ao lado.
+      layout: sidebar_right

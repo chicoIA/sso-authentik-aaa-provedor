@@ -1,0 +1,121 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+#
+# Link para a pessoa DEFINIR A PRÓPRIA SENHA (contas novas e senha esquecida).
+#
+# Não há e-mail (SMTP) no authentik. O NOC gera o link e manda à pessoa:
+#   Diretório > Usuários > (usuário) > "Criar link de recuperação"
+# O link é de uso único e expira. Ele só define a senha: não faz login, então
+# o 2FA continua sendo pedido (e cadastrado) no login seguinte.
+#
+# Sem o link (abrindo o fluxo direto), o fluxo é recusado: não há usuário.
+# Não há "Esqueci a senha" na tela de login.
+version: 1
+metadata:
+  name: Exemplo - Definir senha
+  labels:
+    blueprints.goauthentik.io/description: Link gerado pelo NOC para a pessoa definir a senha
+entries:
+  - model: authentik_flows.flow
+    id: fluxo
+    identifiers:
+      slug: provedor-definir-senha
+    attrs:
+      name: Exemplo - Definir senha
+      title: Defina sua senha
+      designation: recovery
+      authentication: none
+      policy_engine_mode: all
+
+  # Só com o link do NOC: ele já traz o usuário (pending_user) no plano.
+  - model: authentik_policies_expression.expressionpolicy
+    id: so-com-link
+    identifiers:
+      name: provedor-definir-senha-so-com-link
+    attrs:
+      expression: |
+        return context.get("pending_user") is not None
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf fluxo
+      policy: !KeyOf so-com-link
+      order: 0
+    attrs:
+      timeout: 5
+      failure_result: false
+
+  - model: authentik_policies_password.passwordpolicy
+    id: regra-senha
+    identifiers:
+      name: provedor-definir-senha-regras
+    attrs:
+      password_field: password
+      length_min: 10
+      amount_digits: 1
+      amount_lowercase: 1
+      amount_uppercase: 0
+      amount_symbols: 0
+      check_static_rules: true
+      check_have_i_been_pwned: false
+      check_zxcvbn: false
+      error_message: "A senha precisa de pelo menos 10 caracteres, com letras e números."
+
+  - model: authentik_stages_prompt.prompt
+    id: campo-senha
+    identifiers:
+      name: provedor-definir-senha-campo
+    attrs:
+      field_key: password
+      label: Nova senha
+      type: password
+      required: true
+      placeholder: Nova senha
+      order: 10
+
+  - model: authentik_stages_prompt.prompt
+    id: campo-repetir
+    identifiers:
+      name: provedor-definir-senha-repetir
+    attrs:
+      field_key: password_repeat
+      label: Repita a senha
+      type: password
+      required: true
+      placeholder: Repita a senha
+      order: 20
+
+  - model: authentik_stages_prompt.promptstage
+    id: etapa-senha
+    identifiers:
+      name: provedor-definir-senha-etapa
+    attrs:
+      fields:
+        - !KeyOf campo-senha
+        - !KeyOf campo-repetir
+      validation_policies:
+        - !KeyOf regra-senha
+
+  - model: authentik_stages_user_write.userwritestage
+    id: gravar
+    identifiers:
+      name: provedor-definir-senha-gravar
+    attrs:
+      user_creation_mode: never_create
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf fluxo
+      stage: !KeyOf etapa-senha
+      order: 10
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf fluxo
+      stage: !KeyOf gravar
+      order: 20
+
+  # Usado pelo botão "Criar link de recuperação" do painel de admin.
+  - model: authentik_brands.brand
+    identifiers:
+      domain: authentik-default
+    attrs:
+      flow_recovery: !KeyOf fluxo

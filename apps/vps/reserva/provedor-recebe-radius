@@ -1,0 +1,29 @@
+#!/bin/bash
+# VPS: recebe da VM (stdin) o dump das tabelas do FreeRADIUS e troca de uma vez
+# no banco da reserva. Chamado só pela chave da VM em authorized_keys
+# (command=..., from=203.0.113.25). Fonte: apps/vps/reserva/ no git.
+#
+# Segurança da troca: carrega em radius_carga; só se o dump terminou inteiro
+# ("-- Dump completed") e trouxe as 6 tabelas, faz um RENAME atômico. Se algo
+# falhar, o banco da reserva continua com a cópia anterior.
+set -euo pipefail
+CT=provedor-reserva-reserva-mariadb-1
+TABELAS="nas radcheck radreply radgroupcheck radgroupreply radusergroup"
+TMP=$(mktemp /root/.radius-carga.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+head -c 200000000 > "$TMP"            # limite de 200 MB (hoje < 1 MB)
+tail -n 3 "$TMP" | grep -q -- '-- Dump completed' || { echo "dump incompleto" >&2; exit 2; }
+for t in $TABELAS; do
+    grep -q "^CREATE TABLE \`$t\`" "$TMP" || { echo "falta a tabela $t" >&2; exit 3; }
+done
+sql() { docker exec -i "$CT" sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$@"' -- "$@"; }
+sql -e "DROP DATABASE IF EXISTS radius_carga; CREATE DATABASE radius_carga; DROP DATABASE IF EXISTS radius_velho; CREATE DATABASE radius_velho;"
+sql radius_carga < "$TMP"
+REN=""
+for t in $TABELAS; do
+    EXISTE=$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='radius' AND table_name='$t'")
+    [ "$EXISTE" = 1 ] && REN="$REN radius.$t TO radius_velho.$t,"
+    REN="$REN radius_carga.$t TO radius.$t,"
+done
+sql -e "RENAME TABLE ${REN%,}; DROP DATABASE radius_velho; DROP DATABASE radius_carga;"
+sql -N -e "SELECT CONCAT('ok ', NOW(), ' nas=', (SELECT COUNT(*) FROM radius.nas), ' radcheck=', (SELECT COUNT(*) FROM radius.radcheck))"

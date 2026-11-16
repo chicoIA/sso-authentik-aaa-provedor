@@ -1,0 +1,15 @@
+[Unit]
+Description=Firewall de entrada Exemplo da VM Radius (tabela inet provedor)
+Wants=network-pre.target
+Before=network-pre.target
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/provedor-vm.nft
+ExecStop=/usr/sbin/nft delete table inet provedor
+
+[Install]
+WantedBy=multi-user.target

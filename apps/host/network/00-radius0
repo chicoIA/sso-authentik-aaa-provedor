@@ -1,0 +1,12 @@
+# /etc/network/interfaces.d/00-radius0 da VM Radius. Fonte: apps/host/.
+# IP de serviço do RADIUS (anycast) numa interface dummy: não depende de placa.
+# O FRR anuncia este /32 ao S12700 (AS 64500). "00-" para subir antes da ens224,
+# que usa o .196 como origem da rota padrão.
+# "inet manual": com "inet static" o ifupdown 0.8 põe "broadcast 100.66.80.196"
+# na /32, o que cria uma rota de broadcast no mesmo endereço do serviço.
+auto radius0
+iface radius0 inet manual
+	pre-up ip link add radius0 type dummy 2>/dev/null || true
+	up ip addr replace 100.66.80.196/32 dev radius0
+	up ip link set dev radius0 up
+	post-down ip link del radius0 2>/dev/null || true

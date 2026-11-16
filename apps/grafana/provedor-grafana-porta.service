@@ -1,0 +1,15 @@
+# Grafana (:3000) só aceita o proxy nginx (198.51.100.13) e a própria máquina.
+# Desfazer: systemctl disable --now provedor-grafana-porta
+[Unit]
+Description=Exemplo: porta 3000 do Grafana só para o proxy
+After=network-pre.target
+Before=grafana-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -N PV-G3000 2>/dev/null || iptables -F PV-G3000; iptables -A PV-G3000 -i lo -j RETURN; iptables -A PV-G3000 -s 198.51.100.13 -j RETURN; iptables -A PV-G3000 -m limit --limit 10/min -j LOG --log-prefix "PROVEDOR-G3000-BLOQ "; iptables -A PV-G3000 -p tcp -j REJECT --reject-with tcp-reset; iptables -C INPUT -p tcp --dport 3000 -j PV-G3000 2>/dev/null || iptables -I INPUT -p tcp --dport 3000 -j PV-G3000'
+ExecStop=/bin/sh -c 'while iptables -D INPUT -p tcp --dport 3000 -j PV-G3000 2>/dev/null; do :; done; iptables -F PV-G3000 2>/dev/null; iptables -X PV-G3000 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+#!/bin/sh
+# SNMP extend da reserva, lido pelo Zabbix. Fonte: apps/vps/reserva/.
+#   provedor-reserva-snmp codigo   -> número (ver códigos em provedor-reserva)
+#   provedor-reserva-snmp texto    -> descrição
+# Roda como o usuário do snmpd: só lê o arquivo que o vigia grava a cada 15 s.
+# Arquivo com mais de 120 s ou ausente = vigia parado (código 9).
+A=/var/lib/provedor-reserva/zabbix
+if [ -r "$A" ]; then read -r cod ts txt < "$A"; else cod=""; fi
+agora=$(date +%s)
+if [ -z "$cod" ] || [ $((agora - ${ts:-0})) -gt 120 ]; then cod=9; txt="vigia da reserva parado"; fi
+case "${1:-codigo}" in texto) echo "$txt" ;; *) echo "$cod" ;; esac

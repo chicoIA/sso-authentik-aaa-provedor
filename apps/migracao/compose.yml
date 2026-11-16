@@ -1,0 +1,32 @@
+# App migracao: ferramenta sob demanda (daloRADIUS -> authentik). NÃO é serviço:
+# o perfil "ferramenta" impede que suba com o app; use sempre "run --rm".
+#   docker compose -p provedor-migracao --env-file .env -f apps/migracao/compose.yml \
+#       run --rm migracao relatorio --saida /saida/relatorio-$(date +%F).md
+# network_mode host: API do authentik em 127.0.0.1:9000, outpost RADIUS em
+# 127.0.0.1:18120 e MySQL pelo socket (por isso não usa a rede "provedor").
+services:
+  migracao:
+    profiles: ["ferramenta"]
+    build: .
+    image: provedor/migracao:local
+    network_mode: host
+    restart: "no"  # roda e termina (não é daemon)
+    mem_limit: 128m
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DALO_DB_SOCKET: ${DALO_DB_SOCKET:-/run/mysqld/mysqld.sock}
+      DALO_DB_HOST: ${DALO_DB_HOST:-127.0.0.1}
+      DALO_DB_PORT: ${DALO_DB_PORT:-3306}
+      DALO_DB_USER: ${DALO_DB_USER:-radius}
+      DALO_DB_PASS: ${DALO_DB_PASS:-}
+      DALO_DB_NAME: ${DALO_DB_NAME:-radius}
+      AUTHENTIK_API_URL: ${MIGRACAO_API_URL:-http://127.0.0.1:9000}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+      AUTHENTIK_RADIUS_SECRET: ${AUTHENTIK_RADIUS_SECRET:-}
+      MIGRACAO_RADIUS_ALVO: ${MIGRACAO_RADIUS_ALVO:-127.0.0.1:18120}
+    volumes:
+      - /run/mysqld:/run/mysqld:ro
+      - /etc/freeradius/3.0/mods-config/files/authorize:/dados/users:ro
+      - ./saida:/saida

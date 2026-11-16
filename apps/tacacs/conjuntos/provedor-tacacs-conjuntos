@@ -1,0 +1,341 @@
+#!/usr/bin/python3 -I
+# Leva as listas de equipamentos editadas no authentik para o TACACS+ (VM e reserva).
+# Fonte: apps/tacacs/conjuntos/ no git. Instalado em /usr/local/sbin; roda pelo
+# provedor-tacacs-conjuntos.timer (a cada minuto).
+#
+# No authentik, um grupo tacacs-* com os atributos
+#     tacacs_priv_lvl: 15            # perfil no resto: 15 admin, 7 operador, 1 leitura
+#     tacacs_leitura_em:             # equipamentos onde o grupo só tem leitura
+#       172.16.41.254: BORDA-A       # IP de origem do equipamento: nome (livre)
+#     tacacs_operador_em:            # (opcional) equipamentos onde o grupo é operador
+#       172.16.41.250: CORE-A
+# vira, no tac_plus-ng, "leitura nos IPs de tacacs_leitura_em, operador nos de
+# tacacs_operador_em e o perfil do tacacs_priv_lvl nos outros" (IP nas duas = leitura).
+# A regra vem antes dos grupos globais: a restrição vale mesmo para quem também está
+# em tacacs-admin.
+#
+# Segurança: IP inválido é ignorado (aviso); a configuração nova é testada
+# (tac_plus-ng -P) antes de aplicar; se o authentik não responder ou o teste falhar,
+# fica valendo a última lista boa.
+#
+# Membros: o outpost LDAP (bind_mode cached) guarda por 5 min o resultado do bind de
+# cada usuário, inclusive a RECUSA de quem ainda não estava em grupo tacacs-*.
+# Trocar de grupo vale na hora (memberOf é lido ao vivo), mas quem
+# tentou logar sem grupo e foi adicionado continua "Insufficient access" até o cache
+# vencer. Por isso, quando a lista de membros dos grupos tacacs-* muda, este script
+# reinicia o outpost LDAP (~2 s); o tac_plus-ng não precisa (não guarda recusas).
+#
+#   provedor-tacacs-conjuntos            sincroniza (o que o timer roda)
+#   provedor-tacacs-conjuntos --mostrar  só mostra o que seria gerado
+import hashlib, ipaddress, json, os, re, subprocess, sys, tempfile, time, urllib.request
+
+REPO = "/opt/authentik-aaa-provedor"
+DEST = "/etc/provedor-tacacs"                 # montado em /etc/tacacs/conjuntos (ro)
+ESTADO = "/var/lib/provedor-tacacs/conjuntos.estado"
+API = "http://127.0.0.1:9000/api/v3"
+CONTAINER = "provedor-tacacs-tacacs-1"
+LDAP_CONTAINER = "provedor-ldap-ldap-outpost-1"
+MEMBROS = "/var/lib/provedor-tacacs/membros.sha256"
+IMAGEM = "provedor-tacacs:local"
+VPS = "vps"
+VPS_CONTAINER = "provedor-reserva-reserva-tacacs-1"
+PERFIS = {15: "tacacs-admin", 7: "tacacs-operador", 1: "tacacs-leitura"}
+NOME_GRUPO = re.compile(r"^tacacs-[a-z0-9][a-z0-9-]{0,60}$")
+# Login Linux pelo SSO (docs/linux-sso.md): mesma limpeza do cache de bind do outpost.
+GRUPO_LINUX = re.compile(r"^linux-(admin|operador|leitura)(-or-hosts-operador)?$")
+ARQUIVOS = ("redes.cfg", "regras.cfg")
+
+avisos = []
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def ler_env(chave):
+    with open(os.path.join(REPO, ".env")) as f:
+        for linha in f:
+            if linha.startswith(chave + "="):
+                return linha.split("=", 1)[1].strip().strip('"').strip("'")
+    raise SystemExit("%s ausente no .env" % chave)
+
+
+def api(token, metodo, caminho, dados=None):
+    req = urllib.request.Request(API + caminho, method=metodo,
+                                 headers={"Authorization": "Bearer " + token,
+                                          "Content-Type": "application/json"},
+                                 data=json.dumps(dados).encode() if dados is not None else None)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        corpo = r.read()
+        return json.loads(corpo) if corpo else None
+
+
+def grupos(token, prefixo="tacacs-"):
+    res, pagina = [], 1
+    while True:
+        d = api(token, "GET", "/core/groups/?search=%s&include_users=false&page_size=200&page=%d" % (prefixo, pagina))
+        res += d["results"]
+        if not d.get("pagination", {}).get("next"):
+            return res
+        pagina += 1
+
+
+def coment(texto):  # nome livre do equipamento vira comentário seguro
+    return re.sub(r"[^\w .:/()-]", "_", str(texto))[:60]
+
+
+LISTAS = (("tacacs_leitura_em", "leitura", "tacacs-leitura"),     # a mais restrita primeiro:
+          ("tacacs_operador_em", "operador", "tacacs-operador"))   # IP nas duas = leitura
+
+
+def ler_lista(nome, chave, bruto):
+    if isinstance(bruto, list):
+        bruto = {str(x): "" for x in bruto}
+    if not isinstance(bruto, dict):
+        avisos.append("grupo %s: %s deve ser uma lista 'IP: nome'; ignorada" % (nome, chave))
+        return []
+    ips = []
+    for ip, desc in bruto.items():
+        try:
+            rede = ipaddress.ip_network(str(ip).strip(), strict=False)
+            if rede.version != 4:
+                raise ValueError
+        except ValueError:
+            avisos.append("grupo %s: %r em %s não é um IPv4 válido, ignorado" % (nome, ip, chave))
+            continue
+        ips.append((rede, coment(desc)))
+    return sorted(set(ips), key=lambda x: x[0])
+
+
+def gerar(lista):
+    redes, regras = ["# Gerado por provedor-tacacs-conjuntos (não editar).\n"], \
+                    ["# Gerado por provedor-tacacs-conjuntos (não editar).\n"]
+    usados = []
+    for g in sorted(lista, key=lambda x: x["name"]):
+        nome, attrs = g["name"], g.get("attributes") or {}
+        if not any(chave in attrs for chave, _, _ in LISTAS):
+            continue
+        if not NOME_GRUPO.match(nome):
+            avisos.append("grupo %r: nome fora do padrão tacacs-<letras-numeros>, ignorado" % nome)
+            continue
+        perfil = PERFIS.get(attrs.get("tacacs_priv_lvl"))
+        if not perfil:
+            avisos.append("grupo %s: tacacs_priv_lvl deve ser 15, 7 ou 1; ignorado" % nome)
+            continue
+        bloco = ['\t\t\t\tif (memberof =~ /(?i)^cn=%s,/) {\n' % re.escape(nome)]
+        for chave, sufixo, perfil_lista in LISTAS:
+            if chave not in attrs:
+                continue
+            ips = ler_lista(nome, chave, attrs[chave] or {})
+            if not ips:
+                continue
+            net = "c_%s_%s" % (nome.replace("-", "_"), sufixo)
+            redes.append("net %s {  # grupo %s, %s\n" % (net, nome, chave))
+            for rede, desc in ips:
+                ende = str(rede.network_address) if rede.prefixlen == 32 else str(rede)
+                redes.append("\taddress = %-18s # %s\n" % (ende, desc))
+            redes.append("}\n")
+            bloco += ['\t\t\t\t\tif (nas == %s) {\n' % net,
+                      '\t\t\t\t\t\tprofile = %s\n' % perfil_lista, '\t\t\t\t\t\tpermit\n', '\t\t\t\t\t}\n']
+        bloco += ['\t\t\t\t\tprofile = %s\n' % perfil, '\t\t\t\t\tpermit\n', '\t\t\t\t}\n']
+        regras += bloco
+        usados.append(g)
+    return {"redes.cfg": "".join(redes), "regras.cfg": "".join(regras)}, usados
+
+
+def garantir_bind_ldap(token, usados):
+    """Grupo novo precisa poder fazer bind na aplicação LDAP (senão 'Insufficient access')."""
+    if not usados:
+        return
+    app = api(token, "GET", "/core/applications/provedor-ldap/")
+    binds = api(token, "GET", "/policies/bindings/?target=%s&page_size=500" % app["pk"])["results"]
+    tem = {b.get("group") for b in binds}
+    ordem = max([b.get("order", 0) for b in binds] + [20]) + 1
+    for g in usados:
+        if g["pk"] not in tem:
+            api(token, "POST", "/policies/bindings/",
+                {"target": app["pk"], "group": g["pk"], "order": ordem, "enabled": True,
+                 "negate": False, "timeout": 30})
+            log("bind LDAP criado para o grupo %s" % g["name"])
+            ordem += 1
+
+
+def atual():
+    out = {}
+    for a in ARQUIVOS:
+        try:
+            out[a] = open(os.path.join(DEST, a)).read()
+        except FileNotFoundError:
+            out[a] = None
+    return out
+
+
+def validar(conteudo):
+    with tempfile.TemporaryDirectory(prefix="tacacs-conj-") as d:
+        os.chmod(d, 0o755)
+        for a, c in conteudo.items():
+            with open(os.path.join(d, a), "w") as f:
+                f.write(c)
+            os.chmod(os.path.join(d, a), 0o644)
+        p = subprocess.run(["docker", "run", "--rm", "--network", "none",
+                            "-e", "TACACS_KEY=validacao123", "-e", "LDAP_SERVICO_SENHA=x",
+                            "-e", "TACACS_LDAP_BASE_DN=dc=x", "--tmpfs", "/run/tacacs",
+                            "--tmpfs", "/var/log/tacacs", "-v", d + ":/etc/tacacs/conjuntos:ro",
+                            IMAGEM, "-P"], capture_output=True, text=True, timeout=120)
+        return p.returncode == 0, (p.stdout + p.stderr).strip()[-400:]
+
+
+def gravar(conteudo):
+    os.makedirs(DEST, mode=0o755, exist_ok=True)
+    for a, c in conteudo.items():
+        tmp = os.path.join(DEST, "." + a + ".novo")
+        with open(tmp, "w") as f:
+            f.write(c)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(DEST, a))
+
+
+def reiniciar(container, nome):
+    subprocess.run(["docker", "restart", "-t", "5", container], check=True, capture_output=True, timeout=90)
+    for _ in range(30):
+        time.sleep(1)
+        s = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", container],
+                           capture_output=True, text=True).stdout.strip()
+        if s == "true":
+            return
+    raise RuntimeError("%s não voltou depois de reiniciar" % nome)
+
+
+def reiniciar_local():
+    reiniciar(CONTAINER, "TACACS+")
+
+
+def membros_mudaram(lista, arquivo=MEMBROS, regex=NOME_GRUPO):
+    """Hash dos membros dos grupos (tacacs-* ou linux-*); True se mudou desde a última rodada.
+    Na primeira rodada (sem hash gravado) só grava, para não reiniciar à toa."""
+    MEMBROS = arquivo
+    base = sorted((g["name"], sorted(int(u) for u in g.get("users", []))) for g in lista
+                  if regex.match(g.get("name", "")))
+    digest = hashlib.sha256(json.dumps(base).encode()).hexdigest()
+    try:
+        anterior = open(MEMBROS).read().strip()
+    except FileNotFoundError:
+        anterior = None
+    if digest == anterior:
+        return False
+    os.makedirs(os.path.dirname(MEMBROS), exist_ok=True)
+    tmp = MEMBROS + ".novo"
+    with open(tmp, "w") as f:
+        f.write(digest + "\n")
+    os.replace(tmp, MEMBROS)
+    return anterior is not None
+
+
+def sincronizar_vps(conteudo, estado_txt):
+    """Copia os arquivos (se mudaram) e o estado para a VPS; reinicia o TACACS+ da reserva se estiver no ar."""
+    digest = hashlib.sha256("".join(conteudo[a] for a in ARQUIVOS).encode()).hexdigest()
+    script = r'''set -e
+D=/etc/provedor-tacacs; mkdir -p "$D" /var/lib/provedor-tacacs
+cat > /var/lib/provedor-tacacs/conjuntos.estado.novo && mv /var/lib/provedor-tacacs/conjuntos.estado.novo /var/lib/provedor-tacacs/conjuntos.estado
+[ "$(cat "$D/.hash" 2>/dev/null)" = "%s" ] && { echo igual; exit 0; }
+echo diferente''' % digest
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", VPS, script],
+                       input=estado_txt, capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        raise RuntimeError("ssh vps: " + (p.stderr.strip()[-200:] or "falhou"))
+    if p.stdout.strip() == "igual":
+        return False
+    pacote = json.dumps(conteudo)
+    copiar = r'''set -e
+D=/etc/provedor-tacacs
+python3 -I -c '
+import json,os,sys
+d=json.load(sys.stdin)
+for a,c in d.items():
+    t=os.path.join("%s","."+a+".novo"); open(t,"w").write(c); os.chmod(t,0o644); os.replace(t,os.path.join("%s",a))
+'
+echo "%s" > "$D/.hash"
+if [ "$(docker inspect -f '{{.State.Running}}' %s 2>/dev/null)" = true ]; then docker restart -t 5 %s >/dev/null; echo reiniciado; fi''' % ("/etc/provedor-tacacs", "/etc/provedor-tacacs", digest, VPS_CONTAINER, VPS_CONTAINER)
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", VPS, copiar],
+                       input=pacote, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError("cópia para a VPS: " + (p.stderr.strip()[-200:] or "falhou"))
+    return True
+
+
+def gravar_estado(codigo, texto):
+    # codigo: 0 ok, 1 aviso (algo ignorado / VPS atrasada), 2 erro (lista não atualizada)
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    txt = "%d %d %s\n" % (codigo, int(time.time()), texto.replace("\n", " ")[:300])
+    tmp = ESTADO + ".novo"
+    with open(tmp, "w") as f:
+        f.write(txt)
+    os.replace(tmp, ESTADO)
+    return txt
+
+
+def main():
+    mostrar = "--mostrar" in sys.argv
+    token = ler_env("AUTHENTIK_BOOTSTRAP_TOKEN")
+    try:
+        lista = grupos(token)
+    except Exception as e:
+        gravar_estado(2, "authentik não respondeu (%s); mantida a última lista" % type(e).__name__)
+        log("ERRO: authentik não respondeu: %s" % e)
+        return 2
+    conteudo, usados = gerar(lista)
+    if mostrar:
+        for a in ARQUIVOS:
+            print("==> %s\n%s" % (a, conteudo[a]))
+        for x in avisos:
+            print("AVISO:", x)
+        return 0
+    try:
+        garantir_bind_ldap(token, usados)
+    except Exception as e:
+        avisos.append("não consegui conferir o bind LDAP dos grupos (%s)" % type(e).__name__)
+
+    mudou = conteudo != atual()
+    if mudou:
+        ok, saida = validar(conteudo)
+        if not ok:
+            gravar_estado(2, "configuração gerada inválida; mantida a última lista: " + saida)
+            log("ERRO: configuração gerada inválida:\n" + saida)
+            return 2
+        gravar(conteudo)
+        try:
+            reiniciar_local()
+        except Exception as e:
+            gravar_estado(2, "lista gravada, mas o TACACS+ não reiniciou: %s" % e)
+            log("ERRO: %s" % e)
+            return 2
+        log("lista aplicada na VM (%d grupo(s) com conjunto)" % len(usados))
+    try:
+        linux = membros_mudaram(grupos(token, "linux-"), MEMBROS.replace("membros", "membros-linux"), GRUPO_LINUX)
+    except Exception as e:
+        linux = False
+        avisos.append("não consegui ler os grupos linux-* (%s)" % type(e).__name__)
+    if membros_mudaram(lista) or linux:
+        try:
+            reiniciar(LDAP_CONTAINER, "outpost LDAP")
+            log("membros dos grupos tacacs-*/linux-* mudaram: outpost LDAP reiniciado (cache de bind limpo)")
+        except Exception as e:
+            avisos.append("membros mudaram, mas o outpost LDAP não reiniciou (%s)" % e)
+    resumo = "%d grupo(s) com conjunto" % len(usados)
+    codigo = 1 if avisos else 0
+    texto = resumo + ("; avisos: " + " | ".join(avisos) if avisos else "")
+    estado_txt = gravar_estado(codigo, texto)
+    try:
+        if sincronizar_vps(conteudo, estado_txt):
+            log("lista copiada para a reserva da VPS")
+    except Exception as e:
+        gravar_estado(1, texto + "; VPS não atualizada: %s" % e)
+        log("AVISO: VPS não atualizada: %s" % e)
+        return 1
+    for x in avisos:
+        log("AVISO: " + x)
+    return codigo
+
+
+if __name__ == "__main__":
+    sys.exit(main())

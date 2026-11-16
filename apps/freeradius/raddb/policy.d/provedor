@@ -1,0 +1,301 @@
+#  Políticas da Exemplo usadas em sites-available/provedor.
+#
+#  Convenção (lista control, só vive durante o pedido):
+#    Tmp-String-0 = origem da decisão: cache | authentik | legado
+#    Tmp-String-1 = protocolo: pap | chap | mschap | eap | outro
+
+#
+#  Descobre o protocolo de senha usado pelo equipamento.
+#
+provedor_classificar {
+	if (&User-Password) {
+		update control {
+			&Tmp-String-1 := "pap"
+		}
+	}
+	elsif (&CHAP-Password) {
+		update control {
+			&Tmp-String-1 := "chap"
+		}
+	}
+	elsif (&MS-CHAP-Challenge) {
+		update control {
+			&Tmp-String-1 := "mschap"
+		}
+	}
+	elsif (&EAP-Message) {
+		update control {
+			&Tmp-String-1 := "eap"
+		}
+	}
+	else {
+		update control {
+			&Tmp-String-1 := "outro"
+		}
+	}
+}
+
+#
+#  PAP (ver os caches em mods-available/provedor):
+#    1. cache fresco                 -> Accept na hora (origem=cache)
+#    2. sem fresco, com reserva      -> Accept na hora (origem=reserva) e, se a
+#                                       trava estiver livre, uma cópia do pedido
+#                                       vai (replicate, sem esperar) ao servidor
+#                                       virtual "revalidar", que consulta o
+#                                       authentik e atualiza/apaga os caches
+#    3. sem reserva, trava livre     -> cria a trava e consulta o authentik
+#                                       (origem=authentik; primeiro login)
+#    4. sem reserva, trava ocupada   -> espera a consulta em andamento
+#                                       (origem=cache-aguardou) ou fica sem
+#                                       resposta após ~6 s
+#
+provedor_pap {
+	update control {
+		&Cache-Read-Only := yes
+	}
+	provedor_cache
+	if (ok || updated) {
+		update control {
+			&Auth-Type := Accept
+			&Tmp-String-0 := "cache"
+		}
+	}
+	else {
+		update control {
+			&Cache-Status-Only := yes
+		}
+		provedor_cache_reserva
+		if (ok) {
+			#  Trava atômica: uma única chamada procura e, se não existir, cria
+			#  (o rlm_cache_rbtree segura o mutex entre a busca e a inserção).
+			#  updated = esta requisição criou a trava; ok = já havia uma.
+			provedor_cache_trava
+			if (updated) {
+				update control {
+					&Replicate-To-Realm := "PROVEDOR_REVALIDAR"
+				}
+				replicate
+			}
+			update control {
+				&Auth-Type := Accept
+				&Tmp-String-0 := "reserva"
+			}
+		}
+		else {
+			provedor_cache_trava
+			if (ok) {
+				provedor_aguardar
+			}
+			else {
+				update control {
+					&Proxy-To-Realm := "AUTHENTIK_EQUIPAMENTOS"
+					&Tmp-String-0 := "authentik"
+					#  Usado apenas se não houver outpost vivo (ver authenticate).
+					&Auth-Type := Sem-Authentik
+				}
+			}
+		}
+	}
+}
+
+#
+#  Primeiro login da rajada (sem reserva): espera até ~6 s (12 x 0,5 s) a
+#  consulta em andamento preencher o cache fresco. Retransmissões do NAS
+#  chegam com o mesmo ID e seriam descartadas como duplicadas, por isso o
+#  pedido espera aqui em vez de ficar sem resposta.
+#
+provedor_aguardar {
+	update control {
+		&Tmp-Integer-1 := 1
+		&Tmp-Integer-1 += 2
+		&Tmp-Integer-1 += 3
+		&Tmp-Integer-1 += 4
+		&Tmp-Integer-1 += 5
+		&Tmp-Integer-1 += 6
+		&Tmp-Integer-1 += 7
+		&Tmp-Integer-1 += 8
+		&Tmp-Integer-1 += 9
+		&Tmp-Integer-1 += 10
+		&Tmp-Integer-1 += 11
+		&Tmp-Integer-1 += 12
+	}
+	foreach &control:Tmp-Integer-1 {
+		update request {
+			&Tmp-String-6 := "%{provedor_espera:/bin/sleep 0.5}"
+		}
+		update control {
+			&Cache-Read-Only := yes
+		}
+		provedor_cache
+		if (ok || updated) {
+			update control {
+				&Auth-Type := Accept
+				&Tmp-String-0 := "cache-aguardou"
+			}
+			break
+		}
+	}
+	if (&control:Tmp-String-0 != "cache-aguardou") {
+		update control {
+			&Tmp-String-0 := "aguardando"
+		}
+		provedor_log_aguardando
+		do_not_respond
+	}
+}
+
+#
+#  Devolve os atributos guardados na reserva (post-auth, origem=reserva).
+#
+provedor_usar_reserva {
+	if (&control:Tmp-String-0 == "reserva") {
+		update control {
+			&Cache-Read-Only := yes
+		}
+		provedor_cache_reserva
+	}
+}
+
+#
+#  ATENÇÃO (rlm_cache 3.2): Cache-TTL := 0 só apaga se a entrada EXISTIR; se
+#  não existir, o módulo CRIA uma entrada com o TTL padrão. Por isso sempre
+#  conferir antes (Cache-Status-Only) — senão uma recusa criaria uma reserva
+#  para a senha errada.
+#
+provedor_liberar_trava {
+	update control {
+		&Cache-Status-Only := yes
+	}
+	provedor_cache_trava
+	if (ok) {
+		update control {
+			&Cache-TTL := 0
+		}
+		provedor_cache_trava
+	}
+}
+
+provedor_apagar_reserva {
+	update control {
+		&Cache-Status-Only := yes
+	}
+	provedor_cache_reserva
+	if (ok) {
+		update control {
+			&Cache-TTL := 0
+		}
+		provedor_cache_reserva
+	}
+}
+
+#
+#  Resposta do authentik (post-proxy dos servidores default e revalidar):
+#  Accept renova o fresco e a reserva (TTL negativo = substitui a entrada);
+#  Reject (usuário desativado / senha trocada) apaga a reserva na hora.
+#
+provedor_gravar_caches {
+	if (&proxy-reply:Packet-Type == Access-Accept) {
+		#  Sem Proxy-State nem Message-Authenticator (são do pedido original).
+		update proxy-reply {
+			&Proxy-State !* ANY
+			&Message-Authenticator !* ANY
+		}
+		update control {
+			&Cache-TTL := -$ENV{FR_CACHE_TTL}
+			&Cache-Merge := no
+		}
+		provedor_cache
+		update control {
+			&Cache-TTL := -$ENV{FR_CACHE_RESERVA_TTL}
+			&Cache-Merge := no
+		}
+		provedor_cache_reserva
+	}
+	elsif (&proxy-reply:Packet-Type == Access-Reject) {
+		provedor_apagar_reserva
+	}
+	provedor_liberar_trava
+}
+
+#
+#  CHAP / MS-CHAP / EAP: o authentik só aceita PAP. FR_CHAP_LEGADO=sim
+#  (padrão) autentica pelo SQL do daloRADIUS como o FreeRADIUS antigo, para o
+#  ambiente não cair; FR_CHAP_LEGADO=nao recusa. Em ambos os casos registra
+#  quem está usando o protocolo (relatório de migração para PAP).
+#
+provedor_nao_pap {
+	if ("$ENV{FR_CHAP_LEGADO}" == "sim") {
+		update control {
+			&Tmp-String-0 := "legado"
+		}
+		provedor_log_legado
+		chap
+		mschap
+		eap {
+			ok = return
+		}
+		sql
+		expiration
+		logintime
+		pap
+	}
+	else {
+		update control {
+			&Tmp-String-0 := "recusado"
+		}
+		provedor_log_recusa_legado
+		update request {
+			&Module-Failure-Message := "Exemplo: %{client:shortname} enviou %{control:Tmp-String-1}; configure PAP no equipamento"
+		}
+		update reply {
+			&Reply-Message := "Use PAP: o authentik nao aceita CHAP/MS-CHAP"
+		}
+		reject
+	}
+}
+
+#
+#  Sem resposta = o equipamento considera o RADIUS fora do ar e usa o login
+#  local. Se respondêssemos Access-Reject, Huawei/Cisco/Juniper NÃO tentariam
+#  o usuário local e a equipe ficaria trancada para fora.
+#
+provedor_sem_resposta {
+	update request {
+		&Module-Failure-Message := "Exemplo: authentik indisponivel, sem resposta para o NAS (login local)"
+	}
+	provedor_log_sem_resposta
+	do_not_respond
+}
+
+#
+#  Grava radpostauth SEM a senha (o daloRADIUS gravava em texto puro): troca a
+#  senha por um valor fixo antes do módulo sql (só com FR_GRAVAR_SQL=sim).
+#
+provedor_pos_auth_sql {
+	if ("$ENV{FR_GRAVAR_SQL}" == "sim") {
+		update request {
+			&User-Password !* ANY
+			&CHAP-Password !* ANY
+		}
+		if (&control:Tmp-String-0 == "legado") {
+			update request {
+				&User-Password := "(legado)"
+			}
+		}
+		else {
+			update request {
+				&User-Password := "(authentik)"
+			}
+		}
+		-sql
+	}
+}
+
+#
+#  authentik não respondeu (ou não há outpost vivo) num primeiro login (sem
+#  reserva): libera a trava e não responde (o NAS usa o login local).
+#
+provedor_authentik_fora {
+	provedor_liberar_trava
+	provedor_sem_resposta
+}

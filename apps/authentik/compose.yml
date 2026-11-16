@@ -1,0 +1,117 @@
+# App "authentik" (núcleo): PostgreSQL + server + worker. Sem Redis.
+# Subida: ./provedor up authentik  (projeto provedor-authentik, .env da raiz)
+name: provedor-authentik
+
+x-authentik-env: &authentik-env
+  AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+  AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+  AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+  AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?defina PG_PASS no .env}
+  AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?defina AUTHENTIK_SECRET_KEY no .env}
+  AUTHENTIK_ERROR_REPORTING__ENABLED: ${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+  AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+  AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+  AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+  AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-noc@exemplo.net.br}
+  # Consumo reduzido (VM de 1,9 GB): 1 processo web e worker enxuto.
+  AUTHENTIK_WEB__WORKERS: ${AUTHENTIK_WEB__WORKERS:-1}
+  AUTHENTIK_WEB__THREADS: ${AUTHENTIK_WEB__THREADS:-2}
+  AUTHENTIK_WORKER__PROCESSES: ${AUTHENTIK_WORKER__PROCESSES:-1}
+  AUTHENTIK_WORKER__THREADS: ${AUTHENTIK_WORKER__THREADS:-2}
+
+services:
+  authentik-postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60"]
+    environment:
+      POSTGRES_DB: ${PG_DB:-authentik}
+      POSTGRES_USER: ${PG_USER:-authentik}
+      POSTGRES_PASSWORD: ${PG_PASS:?defina PG_PASS no .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - database:/var/lib/postgresql/data
+    # Fase 6: replicação para a VPS (usuário replicador, slot vps_reserva; ver
+    # docs/failover-vps.md). Só IPv4. Quem chega: o firewall da VM só deixa os
+    # túneis da VPS (172.17.55.7 e 172.16.20.5); a VPS conecta em 172.16.7.10
+    # (não no .196, que no failover passa a existir na própria VPS).
+    ports:
+      - "0.0.0.0:5432:5432"
+    networks: [provedor]
+
+  authentik-server:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    command: server
+    restart: unless-stopped
+    mem_limit: 768m
+    environment: *authentik-env
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    ports:
+      - ${COMPOSE_PORT_HTTP:-9000}:9000
+      - ${COMPOSE_PORT_HTTPS:-9443}:9443
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    volumes:
+      - ./data/media:/media
+      - ./data/templates:/templates
+      - ./blueprints:/blueprints/provedor/authentik:ro
+      - ../radius/blueprints:/blueprints/provedor/radius:ro
+      - ../ldap/blueprints:/blueprints/provedor/ldap:ro
+      - ../tacacs/blueprints:/blueprints/provedor/tacacs:ro
+      - ../painel/blueprints:/blueprints/provedor/painel:ro
+    networks: [provedor]
+
+  authentik-worker:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    command: worker
+    restart: unless-stopped
+    mem_limit: 768m  # cresce com o tempo: reinício semanal recomendado (docs/operacao.md)
+    environment:
+      <<: *authentik-env
+      # Só o que os blueprints dos outros apps leem com !Env (não o .env inteiro).
+      AUTHENTIK_URL_EXTERNA: ${AUTHENTIK_URL_EXTERNA:-https://100.66.80.196:9443}
+      AUTHENTIK_RADIUS_SECRET: ${AUTHENTIK_RADIUS_SECRET:-}
+      AUTHENTIK_RADIUS_CLIENT_NETWORKS: ${AUTHENTIK_RADIUS_CLIENT_NETWORKS:-10.233.0.0/16,127.0.0.1/32}
+      LDAP_SERVICO_SENHA: ${LDAP_SERVICO_SENHA:-}
+      AUTHENTIK_LDAP_BASE_DN: ${AUTHENTIK_LDAP_BASE_DN:-dc=ldap,dc=provedor,dc=com,dc=br}
+      PAINEL_OIDC_SECRET: ${PAINEL_OIDC_SECRET:-}
+      PAINEL_URL_EXTERNA: ${PAINEL_URL_EXTERNA:-http://100.66.80.196:9049}
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    volumes:
+      - ./data/media:/media
+      - ./data/certs:/certs
+      - ./data/templates:/templates
+      - ./blueprints:/blueprints/provedor/authentik:ro
+      - ../radius/blueprints:/blueprints/provedor/radius:ro
+      - ../ldap/blueprints:/blueprints/provedor/ldap:ro
+      - ../tacacs/blueprints:/blueprints/provedor/tacacs:ro
+      - ../painel/blueprints:/blueprints/provedor/painel:ro
+    networks: [provedor]
+
+volumes:
+  database:
+
+networks:
+  provedor:
+    external: true
+    name: provedor

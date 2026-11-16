@@ -1,0 +1,99 @@
+#!/usr/bin/python3 -I
+"""Gera a lista de IPs do Brasil para o Caddy (site sso.) a partir do LACNIC.
+
+Fonte: arquivo oficial de delegações do LACNIC (registro que distribui os IPs
+do Brasil), público e atualizado diariamente. Só blocos country=BR
+allocated/assigned, agregados. Redes privadas/CGNAT entram sempre (tráfego
+interno e containers da própria VPS).
+
+Segurança: a lista nova só substitui a atual se passar nas conferências de
+tamanho, contiver IPs conhecidos do Brasil e o Caddyfile validar com ela.
+Qualquer falha mantém a lista anterior (o sso segue funcionando).
+"""
+import ipaddress, os, subprocess, sys, tempfile, urllib.request
+
+URL = "https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest"
+DIR = "/var/lib/docker/volumes/proxy_caddy_data/_data/provedor"   # = /data/provedor no container
+DESTINO = os.path.join(DIR, "brasil.caddy")
+CONTAINER = "proxy-caddy-1"
+INTERNAS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+            "127.0.0.0/8", "fc00::/7", "fe80::/10", "::1/128"]
+# Conferência antes de trocar a lista: ponha aqui IPs públicos SEUS que têm de
+# continuar entrando (NOC, a própria VPS, um IPv6 do seu bloco). Vazio = sem conferência.
+DEVEM_ESTAR = []
+NAO_DEVEM = ["8.8.8.8", "1.1.1.1", "2001:4860::1"]
+
+
+def baixar():
+    with urllib.request.urlopen(URL, timeout=120) as r:
+        return r.read().decode()
+
+
+def gerar(texto):
+    v4, v6 = [], []
+    for linha in texto.splitlines():
+        p = linha.strip().split("|")
+        if len(p) < 7 or p[1] != "BR" or p[6] not in ("allocated", "assigned"):
+            continue
+        if p[2] == "ipv4":
+            a = ipaddress.IPv4Address(p[3])
+            v4 += ipaddress.summarize_address_range(a, a + int(p[4]) - 1)
+        elif p[2] == "ipv6":
+            v6.append(ipaddress.IPv6Network(f"{p[3]}/{p[4]}"))
+    return list(ipaddress.collapse_addresses(v4)), list(ipaddress.collapse_addresses(v6))
+
+
+def conferir(v4, v6):
+    if len(v4) < 3000 or len(v6) < 5000:
+        sys.exit(f"lista pequena demais (v4={len(v4)} v6={len(v6)}): mantendo a atual")
+    redes = v4 + v6
+    for ip in DEVEM_ESTAR:
+        a = ipaddress.ip_address(ip)
+        if not any(a.version == n.version and a in n for n in redes):
+            sys.exit(f"{ip} deveria estar na lista: mantendo a atual")
+    for ip in NAO_DEVEM:
+        a = ipaddress.ip_address(ip)
+        if any(a.version == n.version and a in n for n in redes):
+            sys.exit(f"{ip} não deveria estar na lista: mantendo a atual")
+
+
+def caddy(*args):
+    return subprocess.run(["docker", "exec", CONTAINER, "caddy", *args],
+                          capture_output=True, text=True)
+
+
+def main():
+    v4, v6 = gerar(baixar())
+    conferir(v4, v6)
+    redes = " ".join(INTERNAS + [str(n) for n in v4 + v6])
+    conteudo = ("# GERADO por provedor-geoip-br (fonte: LACNIC, country=BR). Não editar.\n"
+                f"# v4={len(v4)} blocos, v6={len(v6)} blocos\n"
+                f"@fora_do_brasil not remote_ip {redes}\n")
+    os.makedirs(DIR, exist_ok=True)
+    novo = DESTINO + ".novo"
+    with open(novo, "w") as f:
+        f.write(conteudo)
+
+    # Valida o Caddyfile inteiro apontando o import para a lista nova.
+    with open("/opt/proxy/Caddyfile") as f:
+        cf = f.read().replace("/data/provedor/brasil.caddy", "/data/provedor/brasil.caddy.novo")
+    with tempfile.NamedTemporaryFile("w", dir=DIR, suffix=".Caddyfile", delete=False) as t:
+        t.write(cf)
+    try:
+        r = caddy("validate", "--adapter", "caddyfile", "--config",
+                  "/data/provedor/" + os.path.basename(t.name))
+    finally:
+        os.unlink(t.name)
+    if r.returncode != 0:
+        os.unlink(novo)
+        sys.exit("Caddyfile não valida com a lista nova: mantendo a atual\n" + r.stderr[-500:])
+
+    os.replace(novo, DESTINO)
+    r = caddy("reload", "--adapter", "caddyfile", "--config", "/etc/caddy/Caddyfile")
+    if r.returncode != 0:
+        sys.exit("reload do Caddy falhou\n" + r.stderr[-500:])
+    print(f"lista do Brasil atualizada: v4={len(v4)} v6={len(v6)} blocos")
+
+
+if __name__ == "__main__":
+    main()

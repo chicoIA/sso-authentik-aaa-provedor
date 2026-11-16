@@ -1,0 +1,15 @@
+--- mavis_tacplus-ng_ldap.pl	2026-10-12 03:10:20.820459442 -0300
++++ mavis_tacplus-ng_ldap.pl	2026-10-12 03:10:20.828459578 -0300
+@@ -244,8 +244,10 @@
+ 		sub get_memberof($) {
+ 			my $mesg = $ldap->search(base => $_[0], scope=>'base', filter=>'(objectclass=*)', attrs=>['memberOf']);
+ 			if ($mesg->code){
+-				$V[AV_A_USER_RESPONSE] = $mesg->error . " (" . __LINE__ . ")";
+-				goto fatal;
++				# Exemplo: o outpost LDAP do authentik pode recusar a busca base em grupos;
++				# isso só impede a expansão de grupos aninhados, não deve derrubar o login.
++				printf STDERR "memberOf: busca em %s falhou: %s\n", $_[0], $mesg->error;
++				return [ ];
+ 			}
+ 			my $entry = $mesg->entry(0);
+ 			return $entry->get_value('memberOf', asref => 1) if $entry;

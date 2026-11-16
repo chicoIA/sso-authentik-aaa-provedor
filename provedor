@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+# Orquestrador do ambiente Exemplo (authentik + RADIUS + LDAP + FreeRADIUS + TACACS+).
+# Cada app de ./apps é um projeto Docker Compose próprio (provedor-<app>) que lê o
+# .env único da raiz e usa a rede Docker externa "provedor". Ajuda: ./provedor ajuda
+#
+# Produção (FreeRADIUS, MariaDB e Apache do sistema) nunca é tocada por este script,
+# exceto pela "virada", que só acontece com confirmação digitada.
+set -euo pipefail
+
+RAIZ="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+APPS="$RAIZ/apps"
+ENVF="$RAIZ/.env"
+REDE=provedor
+REDE_SUBNET=10.233.10.0/24
+REDE_GATEWAY=10.233.10.1
+POOL_DOCKER=10.233.0.0/16
+VOLUME_TACACS=provedor-tacacs-logs
+MEM_MINIMA_MB=600
+FR_SQL_SISTEMA=/etc/freeradius/3.0/mods-available/sql
+
+# Ordem do "base". tacacs e painel só sobem quando nomeados explicitamente.
+BASE=(authentik radius ldap freeradius)
+COM_COMPOSE=(authentik radius ldap freeradius tacacs painel)
+ORDEM_ENV=(authentik radius ldap freeradius migracao backup banco tacacs painel)
+
+msg()   { echo "[provedor] $*"; }
+aviso() { echo "[provedor] AVISO: $*" >&2; }
+erro()  { echo "[provedor] ERRO: $*" >&2; exit 1; }
+
+ajuda() {
+    cat <<'EOF'
+Uso: ./provedor <comando> [argumentos]       (rode como root)
+
+Preparação
+  preparar                 confere o pool do Docker (10.233.0.0/16), cria a rede "provedor"
+                           (10.233.10.0/24) e o volume provedor-tacacs-logs, e cria/completa o
+                           .env a partir de apps/*/env.example (segredos aleatórios; DALO_DB_*
+                           lidos do FreeRADIUS do sistema). Nunca sobrescreve valores existentes.
+  exemplo                  regenera o .env.example da raiz a partir de apps/*/env.example
+
+Apps (app = authentik | radius | ldap | freeradius | tacacs | painel, ou "base")
+  up <app|base>            sobe (base = authentik -> tokens -> radius -> ldap -> freeradius)
+  down <app|base>          derruba (não apaga volumes)
+  restart <app|base>       recria os containers (relê o .env)
+  logs <app|base> [args]   logs (padrão --tail=100; ex.: ./provedor logs freeradius -f)
+  ps <app|base>            containers do app
+  config <app>             valida o compose do app com o .env (docker compose config -q)
+  teste <app|base|todos>   roda apps/<app>/teste.sh com o app JÁ NO AR
+                           (todos = base + migracao + tacacs/painel se estiverem no ar)
+  status                   containers, memória, e saúde da PRODUÇÃO (freeradius, mariadb,
+                           apache2 do sistema e aceites em radpostauth nos últimos 10 min)
+  tokens                   grava no .env os tokens dos outposts (AUTHENTIK_RADIUS_TOKEN/LDAP)
+
+Migração, cópias e virada
+  migrar relatorio [args]  relatório do que será migrado (apps/migracao/saida/)
+  migrar simular           mostra o que "aplicar" faria, sem gravar
+  migrar aplicar [args]    cria/atualiza grupos e usuários no authentik (idempotente)
+  migrar verificar [args]  compara daloRADIUS x authentik (--radius = login real no outpost)
+  backup <args>            apps/backup/backup.sh (completo | pre-virada | listar | ...)
+  virada status            quem atende 1812/1813
+  virada ativar            FreeRADIUS novo assume 1812/1813 (pede confirmação)
+  virada voltar            rollback: o FreeRADIUS do sistema volta (pede confirmação)
+
+Regras: a subida é recusada com menos de 600 MB livres (MemAvailable+SwapFree) e com a
+produção (mariadb/freeradius do sistema) fora do ar. Segredos nunca são impressos.
+EOF
+}
+
+# ---------------------------------------------------------------- utilidades
+
+exigir_root() { [ "$(id -u)" = 0 ] || erro "rode como root (sudo ./provedor $*)"; }
+exigir_env()  { [ -f "$ENVF" ] || erro "$ENVF não existe: rode ./provedor preparar"; }
+
+# Valor de uma variável do .env (sem aspas). Uso interno: nunca imprima segredos com isto.
+envv() {
+    local l
+    l=$(grep -E "^$1=" "$ENVF" 2>/dev/null | tail -n1) || true
+    l=${l#*=}
+    case "$l" in
+        \"*\") l=${l#\"}; l=${l%\"} ;;
+        \'*\') l=${l#\'}; l=${l%\'} ;;
+    esac
+    printf '%s' "$l"
+}
+
+dc() { # app args...
+    local app=$1; shift
+    docker compose -p "provedor-$app" --env-file "$ENVF" -f "$APPS/$app/compose.yml" "$@"
+}
+
+eh_app_compose() { local a; for a in "${COM_COMPOSE[@]}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+
+lista_apps() { # app|base -> nomes (um por linha)
+    case "$1" in
+        base) printf '%s\n' "${BASE[@]}" ;;
+        *) eh_app_compose "$1" || erro "app desconhecido ou sem containers: '$1' (use: ${COM_COMPOSE[*]} ou base; migracao/backup têm comandos próprios)"
+           echo "$1" ;;
+    esac
+}
+
+mem_livre_mb() { awk '/^MemAvailable:/{a=$2} /^SwapFree:/{s=$2} END{print int((a+s)/1024)}' /proc/meminfo; }
+
+checar_memoria() {
+    local livre; livre=$(mem_livre_mb)
+    if [ "$livre" -lt "$MEM_MINIMA_MB" ]; then
+        erro "memória insuficiente para subir '$1': ${livre} MB livres (MemAvailable+SwapFree) < ${MEM_MINIMA_MB} MB. Nada foi iniciado."
+    fi
+    msg "memória livre: ${livre} MB (mínimo ${MEM_MINIMA_MB} MB)"
+}
+
+virada_ativa() { [ "$(envv FR_PORTA_AUTH)" = 1812 ]; }
+
+ativo() { systemctl is-active --quiet "$1" 2>/dev/null; }
+
+# A produção precisa estar saudável antes e entre cada passo de subida.
+checar_producao() {
+    ativo mariadb || erro "PRODUÇÃO: mariadb do sistema não está ativo. Nada foi iniciado; verifique antes de continuar."
+    virada_ativa || ativo apache2 || aviso "PRODUÇÃO: apache2 (daloRADIUS) não está ativo."
+    if virada_ativa; then
+        docker ps -q --filter label=com.docker.compose.project=provedor-freeradius --filter status=running | grep -q . \
+            || aviso "PRODUÇÃO: virada ativa (FR_PORTA_AUTH=1812) e o container freeradius não está rodando."
+    else
+        ativo freeradius || erro "PRODUÇÃO: freeradius do sistema não está ativo. Nada foi iniciado; verifique antes de continuar."
+    fi
+}
+
+checar_rede() {
+    docker network inspect "$REDE" >/dev/null 2>&1 || erro "rede Docker '$REDE' não existe: rode ./provedor preparar"
+}
+
+checar_volume_tacacs() {
+    docker volume inspect "$VOLUME_TACACS" >/dev/null 2>&1 || erro "volume '$VOLUME_TACACS' não existe: rode ./provedor preparar"
+}
+
+confirmar() { # mensagem palavra
+    local resp
+    [ -r /dev/tty ] || erro "confirmação necessária e não há terminal interativo."
+    echo
+    echo "$1"
+    printf 'Digite %s para confirmar (qualquer outra coisa cancela): ' "$2" >/dev/tty
+    read -r resp </dev/tty || resp=""
+    [ "$resp" = "$2" ] || erro "cancelado."
+}
+
+esperar_authentik() {
+    local i
+    msg "aguardando o authentik ficar pronto (http://127.0.0.1:9000/-/health/ready/, até 8 min)..."
+    for i in $(seq 1 48); do
+        if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9000/-/health/ready/; then
+            msg "authentik pronto."
+            return 0
+        fi
+        sleep 10
+    done
+    erro "o authentik não ficou pronto em 8 min. Veja: ./provedor logs authentik"
+}
+
+esperar_container() { # app
+    local i
+    for i in $(seq 1 30); do
+        if [ -n "$(dc "$1" ps -q --status running 2>/dev/null)" ]; then
+            sleep 3
+            # continua rodando depois de alguns segundos (não entrou em loop de reinício)?
+            if [ -n "$(dc "$1" ps -q --status running 2>/dev/null)" ]; then
+                msg "$1 rodando."
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    erro "$1 não ficou rodando. Veja: ./provedor logs $1"
+}
+
+# ---------------------------------------------------------------- preparar
+
+checar_pool_docker() {
+    [ -r /etc/docker/daemon.json ] || erro "/etc/docker/daemon.json não existe. Configure \"default-address-pools\" com $POOL_DOCKER e reinicie o Docker antes."
+    python3 -I - "$POOL_DOCKER" <<'PY' || erro "/etc/docker/daemon.json sem o pool $POOL_DOCKER em default-address-pools (o Docker poderia criar redes em 172.16.0.0/12, onde estão os NAS). Ajuste e reinicie o Docker antes."
+import json, sys
+d = json.load(open("/etc/docker/daemon.json"))
+sys.exit(0 if any(p.get("base") == sys.argv[1] for p in d.get("default-address-pools", [])) else 1)
+PY
+    msg "pool do Docker ok ($POOL_DOCKER em /etc/docker/daemon.json)."
+}
+
+preparar_rede() {
+    if docker network inspect "$REDE" >/dev/null 2>&1; then
+        local sub
+        sub=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$REDE")
+        case " $sub " in
+            *" $REDE_SUBNET "*) msg "rede '$REDE' já existe ($REDE_SUBNET)." ;;
+            *) erro "a rede '$REDE' existe com outra faixa ($sub); esperado $REDE_SUBNET." ;;
+        esac
+    else
+        docker network create --driver bridge --subnet "$REDE_SUBNET" --gateway "$REDE_GATEWAY" "$REDE" >/dev/null
+        msg "rede '$REDE' criada ($REDE_SUBNET)."
+    fi
+    if docker volume inspect "$VOLUME_TACACS" >/dev/null 2>&1; then
+        msg "volume '$VOLUME_TACACS' já existe."
+    else
+        docker volume create "$VOLUME_TACACS" >/dev/null
+        msg "volume '$VOLUME_TACACS' criado."
+    fi
+    # Pastas montadas pelo authentik (o container roda com uid 1000).
+    mkdir -p "$APPS/authentik/data/media" "$APPS/authentik/data/templates" "$APPS/authentik/data/certs"
+    chown 1000:1000 "$APPS/authentik/data/media" "$APPS/authentik/data/templates" "$APPS/authentik/data/certs"
+}
+
+# Gera/completa o .env (modo env) ou o .env.example da raiz (modo exemplo).
+# Só imprime NOMES de variáveis, nunca valores.
+gerar_env() { # modo
+    local apps=() a
+    for a in "${ORDEM_ENV[@]}"; do [ -f "$APPS/$a/env.example" ] && apps+=("$a"); done
+    for a in "$APPS"/*/env.example; do
+        a=$(basename "$(dirname "$a")")
+        case " ${apps[*]} " in *" $a "*) ;; *) apps+=("$a") ;; esac
+    done
+    python3 -I - "$1" "$RAIZ" "$FR_SQL_SISTEMA" "${apps[@]}" <<'PY'
+import os, re, secrets, string, sys, datetime
+
+modo, raiz, fr_sql, apps = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+ENVF = os.path.join(raiz, ".env")
+EXEMPLO = os.path.join(raiz, ".env.example")
+ATIVA = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+SEGURO = re.compile(r"^[A-Za-z0-9._@%+=:,/-]*$")
+TAMANHO = {"AUTHENTIK_SECRET_KEY": 60, "AUTHENTIK_BOOTSTRAP_TOKEN": 60, "PAINEL_SECRET_KEY": 50}
+ALFABETO = string.ascii_letters + string.digits
+
+def gerar(chave):
+    return "".join(secrets.choice(ALFABETO) for _ in range(TAMANHO.get(chave, 40)))
+
+def sem_aspas(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    return v
+
+def formatar(chave, v):
+    """Valor que funciona no docker compose (sem interpolar $) e no 'source' do bash."""
+    if SEGURO.match(v):
+        return v
+    if "'" not in v and "\n" not in v:
+        return "'" + v + "'"
+    raise ValueError(chave)
+
+def placeholder(v):
+    return v.startswith("<") and v.endswith(">")
+
+# ---- blocos de cada env.example
+blocos = []
+for app in apps:
+    with open(os.path.join(raiz, "apps", app, "env.example"), encoding="utf-8") as f:
+        blocos.append((app, f.read().splitlines()))
+
+if modo == "exemplo":
+    saida = [
+        "# .env.example GERADO por ./provedor exemplo a partir de apps/*/env.example (não edite aqui).",
+        "# O .env real é criado por: sudo ./provedor preparar  (gera segredos; nunca faça commit do .env)",
+        '# "<gerar>" = segredo aleatório gerado pelo orquestrador; "<token>" = preenchido por ./provedor tokens.',
+        "",
+    ]
+    vistos = set()
+    for app, linhas in blocos:
+        saida.append(f"# ==================== apps/{app}/env.example ====================")
+        for l in linhas:
+            m = ATIVA.match(l)
+            if m and m.group(1) in vistos:
+                saida.append("# (já definida acima) " + l)
+                continue
+            if m:
+                vistos.add(m.group(1))
+            saida.append(l)
+        saida.append("")
+    with open(EXEMPLO, "w", encoding="utf-8") as f:
+        f.write("\n".join(saida).rstrip("\n") + "\n")
+    print(f"[provedor] {EXEMPLO} gerado ({len(vistos)} variáveis de {len(blocos)} apps).")
+    sys.exit(0)
+
+# ---- DALO_DB_* a partir do FreeRADIUS do sistema (somente leitura; nada é impresso)
+db = {}
+try:
+    with open(fr_sql, encoding="utf-8", errors="replace") as f:
+        dentro = False
+        for linha in f:
+            s = linha.strip()
+            if not s or s.startswith("#"):
+                continue
+            if not dentro:
+                dentro = bool(re.match(r"^sql\s*\{", s))
+                continue
+            m = re.match(r'^(login|password|radius_db|server|port)\s*=\s*("([^"]*)"|\S+)', s)
+            if m and m.group(1) not in db:
+                db[m.group(1)] = m.group(3) if m.group(3) is not None else m.group(2)
+except OSError as e:
+    print(f"[provedor] AVISO: não consegui ler {fr_sql} ({e.strerror}); preencha DALO_DB_* à mão.", file=sys.stderr)
+do_fr = {}
+for k_fr, k_env in (("login", "DALO_DB_USER"), ("password", "DALO_DB_PASS"), ("radius_db", "DALO_DB_NAME"), ("port", "DALO_DB_PORT")):
+    v = db.get(k_fr, "")
+    if v and "${" not in v and "$ENV" not in v:
+        do_fr[k_env] = v
+srv = db.get("server", "")
+if srv and srv not in ("localhost", "127.0.0.1"):
+    print(f"[provedor] AVISO: o FreeRADIUS do sistema usa um servidor MySQL remoto; o FreeRADIUS novo só usa o socket local.", file=sys.stderr)
+
+# ---- .env atual
+existente = []
+if os.path.exists(ENVF):
+    with open(ENVF, encoding="utf-8") as f:
+        existente = f.read().splitlines()
+atuais = {}
+for i, l in enumerate(existente):
+    m = ATIVA.match(l)
+    if m:
+        atuais[m.group(1)] = (i, sem_aspas(m.group(2)))
+
+gerados, do_freeradius, pendentes, problemas = [], [], [], []
+
+def valor_para(chave, exemplo):
+    """Valor novo para uma chave ausente/vazia no .env, ou None para deixar vazio."""
+    exemplo = sem_aspas(exemplo)
+    if chave in do_fr:
+        do_freeradius.append(chave)
+        return do_fr[chave]
+    if exemplo == "<gerar>":
+        gerados.append(chave)
+        return gerar(chave)
+    if placeholder(exemplo):      # <token>, <senha ...>: fica vazio
+        pendentes.append(chave)
+        return ""
+    return exemplo
+
+novas_linhas = list(existente)
+acrescentar = []
+vistos = set()
+for app, linhas in blocos:
+    bloco_novo = []
+    for l in linhas:
+        m = ATIVA.match(l)
+        if not m:
+            bloco_novo.append(l)
+            continue
+        chave, exemplo = m.group(1), m.group(2)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        if chave in atuais:
+            i, atual = atuais[chave]
+            if atual and not placeholder(atual):
+                continue                      # valor existente: nunca sobrescreve
+            v = valor_para(chave, exemplo)
+            try:
+                novas_linhas[i] = f"{chave}={formatar(chave, v)}" if v else f"{chave}="
+            except ValueError:
+                problemas.append(chave); novas_linhas[i] = f"{chave}="
+            continue
+        v = valor_para(chave, exemplo)
+        try:
+            bloco_novo.append(f"{chave}={formatar(chave, v)}" if v else f"{chave}=")
+        except ValueError:
+            problemas.append(chave); bloco_novo.append(f"{chave}=")
+    if any(ATIVA.match(x) for x in bloco_novo) or not existente:
+        acrescentar.append(f"# ==================== apps/{app} ====================")
+        acrescentar.extend(bloco_novo)
+        acrescentar.append("")
+
+# DALO_DB_PORT não está em nenhum env.example como variável ativa (scripts de backup usam).
+if "DALO_DB_PORT" not in atuais and "DALO_DB_PORT" not in vistos and "DALO_DB_PORT" in do_fr:
+    acrescentar += ["# porta do MariaDB do sistema (lida do FreeRADIUS atual)", f"DALO_DB_PORT={formatar('DALO_DB_PORT', do_fr['DALO_DB_PORT'])}", ""]
+    do_freeradius.append("DALO_DB_PORT")
+
+if not existente:
+    cabecalho = ["# .env do ambiente Exemplo, criado por ./provedor preparar em "
+                 + datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + ".",
+                 "# CONTÉM SEGREDOS: modo 600, nunca faça commit. Valores existentes nunca são sobrescritos.", ""]
+    final = cabecalho + acrescentar
+elif acrescentar:
+    final = novas_linhas + ["", "# ---- completado por ./provedor preparar em "
+                            + datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + " ----"] + acrescentar
+else:
+    final = novas_linhas
+
+os.umask(0o077)
+tmp = ENVF + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write("\n".join(final).rstrip("\n") + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, ENVF)
+
+print(f"[provedor] .env {'criado' if not existente else 'conferido/completado'} (modo 600).")
+if gerados:
+    print("[provedor] segredos gerados: " + ", ".join(gerados))
+if do_freeradius:
+    print("[provedor] lidos do FreeRADIUS do sistema: " + ", ".join(do_freeradius))
+if pendentes:
+    print("[provedor] ficaram vazios (preenchidos depois, ex.: ./provedor tokens): " + ", ".join(pendentes))
+if problemas:
+    print("[provedor] AVISO: valor com aspas simples/quebra de linha não representável; preencha à mão: "
+          + ", ".join(problemas), file=sys.stderr)
+PY
+}
+
+cmd_preparar() {
+    exigir_root preparar
+    command -v docker >/dev/null || erro "docker não encontrado."
+    command -v python3 >/dev/null || erro "python3 não encontrado."
+    checar_pool_docker
+    preparar_rede
+    gerar_env env
+    chmod 600 "$ENVF"
+    # DALO_DB_PASS é obrigatório para o FreeRADIUS novo e a migração.
+    [ -n "$(envv DALO_DB_PASS)" ] || aviso "DALO_DB_PASS vazio no .env: preencha com a senha do usuário radius do MariaDB."
+    msg "pronto. Próximo passo: ./provedor up authentik"
+}
+
+# ---------------------------------------------------------------- apps
+
+guarda_freeradius_up() {
+    local pa; pa=$(envv FR_PORTA_AUTH); pa=${pa:-11812}
+    if [ "$pa" = 1812 ] || [ "$pa" = 1813 ]; then
+        ativo freeradius && erro "FR_PORTA_AUTH=$pa no .env e o FreeRADIUS do sistema está ATIVO: conflito na 1812. Para testar use 11812/11813; a troca é só com ./provedor virada ativar."
+        confirmar "ATENÇÃO: virada ativa: o container freeradius atende a PRODUÇÃO em 1812/1813. Recriá-lo derruba o RADIUS por alguns segundos." RECRIAR
+    elif [ "$pa" != 11812 ]; then
+        aviso "FR_PORTA_AUTH=$pa (o padrão de teste é 11812)."
+    fi
+}
+
+guarda_derrubar() { # app acao
+    virada_ativa || return 0
+    case "$1" in
+        freeradius)
+            confirmar "ATENÇÃO: virada ativa: '$2 freeradius' tira a PRODUÇÃO do ar (1812/1813 sem resposta).
+Para devolver o atendimento ao FreeRADIUS do sistema use: ./provedor virada voltar" DERRUBAR ;;
+        authentik|radius)
+            confirmar "ATENÇÃO: virada ativa: '$2 $1' faz os equipamentos ficarem sem resposta RADIUS
+(entra o usuário local de emergência). Prefira ./provedor virada voltar antes." DERRUBAR ;;
+    esac
+}
+
+subir_um() { # app
+    local app=$1
+    checar_rede
+    checar_producao
+    checar_memoria "$app"
+    case "$app" in
+        tacacs|painel) checar_volume_tacacs ;;
+        freeradius) guarda_freeradius_up ;;
+        radius) [ -n "$(envv AUTHENTIK_RADIUS_TOKEN)" ] || erro "AUTHENTIK_RADIUS_TOKEN vazio: suba o authentik e rode ./provedor tokens" ;;
+        ldap) [ -n "$(envv AUTHENTIK_LDAP_TOKEN)" ] || erro "AUTHENTIK_LDAP_TOKEN vazio: suba o authentik e rode ./provedor tokens" ;;
+    esac
+    msg "subindo $app (projeto provedor-$app)..."
+    dc "$app" up -d --build
+    case "$app" in
+        authentik) esperar_authentik ;;
+        *) esperar_container "$app" ;;
+    esac
+    checar_producao
+}
+
+tokens_com_espera() {
+    local i
+    msg "buscando os tokens dos outposts (os blueprints podem levar alguns minutos)..."
+    for i in $(seq 1 20); do
+        if python3 -I "$APPS/authentik/scripts/tokens_outpost.py" --env "$ENVF" --gravar >/dev/null 2>&1; then
+            msg "tokens gravados no .env."
+            return 0
+        fi
+        sleep 15
+    done
+    python3 -I "$APPS/authentik/scripts/tokens_outpost.py" --env "$ENVF" --gravar || true
+    erro "não consegui obter os tokens. Confira os blueprints: ./provedor teste authentik"
+}
+
+cmd_up() {
+    exigir_root up; exigir_env
+    local alvo=${1:-}; [ -n "$alvo" ] || erro "uso: ./provedor up <app|base>"
+    if [ "$alvo" = base ]; then
+        subir_um authentik
+        if [ -z "$(envv AUTHENTIK_RADIUS_TOKEN)" ] || [ -z "$(envv AUTHENTIK_LDAP_TOKEN)" ]; then
+            tokens_com_espera
+        else
+            msg "tokens dos outposts já estão no .env."
+        fi
+        subir_um radius
+        subir_um ldap
+        subir_um freeradius
+        msg "base no ar. Teste: ./provedor teste base   |   produção: ./provedor status"
+        return
+    fi
+    local app; app=$(lista_apps "$alvo")
+    subir_um "$app"
+}
+
+cmd_down() {
+    exigir_root down; exigir_env
+    local alvo=${1:-}; [ -n "$alvo" ] || erro "uso: ./provedor down <app|base>"
+    local apps=() i
+    lista_apps "$alvo" >/dev/null
+    mapfile -t apps < <(lista_apps "$alvo")
+    for ((i=${#apps[@]}-1; i>=0; i--)); do
+        guarda_derrubar "${apps[$i]}" down
+        msg "derrubando ${apps[$i]}..."
+        dc "${apps[$i]}" down
+    done
+}
+
+cmd_restart() {
+    exigir_root restart; exigir_env
+    local alvo=${1:-}; [ -n "$alvo" ] || erro "uso: ./provedor restart <app|base>"
+    local apps=() a
+    lista_apps "$alvo" >/dev/null
+    mapfile -t apps < <(lista_apps "$alvo")
+    for a in "${apps[@]}"; do
+        guarda_derrubar "$a" restart
+        checar_producao
+        checar_memoria "$a"
+        msg "recriando $a..."
+        dc "$a" up -d --build --force-recreate
+        if [ "$a" = authentik ]; then esperar_authentik; else esperar_container "$a"; fi
+    done
+}
+
+cmd_logs() {
+    exigir_root logs; exigir_env
+    local alvo=${1:-}; [ -n "$alvo" ] || erro "uso: ./provedor logs <app|base> [args]"; shift
+    local apps=() a
+    lista_apps "$alvo" >/dev/null
+    mapfile -t apps < <(lista_apps "$alvo")
+    if [ "${#apps[@]}" -gt 1 ]; then
+        for a in "${apps[@]}"; do echo "===== $a"; dc "$a" logs --tail=50 --no-color; done
+    elif [ $# -gt 0 ]; then
+        dc "${apps[0]}" logs "$@"
+    else
+        dc "${apps[0]}" logs --tail=100
+    fi
+}
+
+cmd_ps() {
+    exigir_root ps; exigir_env
+    local alvo=${1:-base} apps=() a
+    lista_apps "$alvo" >/dev/null
+    mapfile -t apps < <(lista_apps "$alvo")
+    for a in "${apps[@]}"; do echo "===== $a"; dc "$a" ps; done
+}
+
+cmd_config() {
+    exigir_env
+    local app=${1:-}; [ -n "$app" ] || erro "uso: ./provedor config <app>"
+    case "$app" in
+        migracao) docker compose -p provedor-migracao --env-file "$ENVF" -f "$APPS/migracao/compose.yml" --profile ferramenta config -q ;;
+        *) app=$(lista_apps "$app"); dc "$app" config -q ;;
+    esac
+    msg "compose de $app válido."
+}
+
+cmd_teste() {
+    exigir_root teste; exigir_env
+    local alvo=${1:-}; [ -n "$alvo" ] || erro "uso: ./provedor teste <app|base|todos>"
+    local apps=() a falhas=()
+    case "$alvo" in
+        base) apps=("${BASE[@]}") ;;
+        todos)
+            apps=("${BASE[@]}" migracao)
+            for a in tacacs painel; do
+                if [ -n "$(dc "$a" ps -q --status running 2>/dev/null)" ]; then apps+=("$a"); else msg "$a não está no ar: teste pulado."; fi
+            done ;;
+        *) [ -x "$APPS/$alvo/teste.sh" ] || erro "apps/$alvo/teste.sh não existe"; apps=("$alvo") ;;
+    esac
+    for a in "${apps[@]}"; do
+        echo "===================== teste: $a"
+        if "$APPS/$a/teste.sh"; then msg "teste $a: OK"; else falhas+=("$a"); msg "teste $a: FALHOU"; fi
+    done
+    echo
+    if [ "${#falhas[@]}" -gt 0 ]; then erro "testes com falha: ${falhas[*]}"; fi
+    msg "todos os testes passaram (${apps[*]})."
+}
+
+# ---------------------------------------------------------------- status
+
+radpostauth_10min() {
+    local cnf=/root/.my-radius.cnf tmp="" n
+    if [ ! -r "$cnf" ]; then
+        [ -n "$(envv DALO_DB_PASS)" ] || { echo "?"; return; }
+        tmp=$(mktemp); chmod 600 "$tmp"
+        printf '[client]\nuser=%s\npassword=%s\nsocket=%s\n' "$(envv DALO_DB_USER)" "$(envv DALO_DB_PASS)" \
+            "$( [ -n "$(envv DALO_DB_SOCKET)" ] && envv DALO_DB_SOCKET || echo /run/mysqld/mysqld.sock)" >"$tmp"
+        cnf=$tmp
+    fi
+    n=$(timeout 20 mysql --defaults-file="$cnf" -N -B "$( [ -n "$(envv DALO_DB_NAME)" ] && envv DALO_DB_NAME || echo radius)" \
+        -e "SELECT COUNT(*) FROM radpostauth WHERE authdate > NOW() - INTERVAL 10 MINUTE" 2>/dev/null) || n="erro na consulta"
+    [ -z "$tmp" ] || rm -f "$tmp"
+    echo "$n"
+}
+
+cmd_status() {
+    exigir_root status
+    echo "===== containers (projetos provedor-*)"
+    docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Status}}' \
+        | grep '^provedor-' | sort | column -t -s $'\t' || echo "nenhum"
+    echo
+    echo "===== memória por container"
+    local ids; ids=$(docker ps -q --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{.Id}} {{index .Config.Labels "com.docker.compose.project"}}' | awk '$2 ~ /^provedor-/{print $1}')
+    if [ -n "$ids" ]; then
+        # shellcheck disable=SC2086
+        docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' $ids | column -t -s $'\t'
+    else
+        echo "nenhum container rodando"
+    fi
+    echo
+    echo "===== host"
+    awk '/^MemTotal:|^MemAvailable:|^SwapTotal:|^SwapFree:/{printf "%-14s %6d MB\n", $1, $2/1024}' /proc/meminfo
+    echo "livre p/ subir: $(mem_livre_mb) MB (mínimo $MEM_MINIMA_MB)"
+    echo
+    echo "===== PRODUÇÃO"
+    local s
+    for s in freeradius mariadb apache2; do printf '%-12s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || true)"; done
+    if [ -f "$ENVF" ]; then
+        if virada_ativa; then echo "virada:      ATIVA (container freeradius em 1812/1813, FR_GRAVAR_SQL=$(envv FR_GRAVAR_SQL))"
+        else echo "virada:      não (FreeRADIUS novo em teste: $(envv FR_PORTA_AUTH)/$(envv FR_PORTA_ACCT))"; fi
+    fi
+    echo "radpostauth: $(radpostauth_10min) aceites nos últimos 10 min (o zabbix vem em rajadas: compare com o mesmo horário de outros dias)"
+    echo "UDP RADIUS escutando:"
+    ss -H -lunp 2>/dev/null | awk '$4 ~ /:(1812|1813|11812|11813|18120)$/{print "  " $4 "  " $NF}' || true
+}
+
+# ---------------------------------------------------------------- migração, backup, virada, tokens
+
+cmd_migrar() {
+    exigir_root migrar; exigir_env
+    local acao=${1:-}
+    [ -n "$acao" ] || erro "uso: ./provedor migrar relatorio|simular|aplicar|verificar [args]"
+    shift
+    local DCM=(docker compose -p provedor-migracao --env-file "$ENVF" -f "$APPS/migracao/compose.yml" --profile ferramenta)
+    checar_producao
+    checar_memoria migracao
+    "${DCM[@]}" build -q migracao
+    case "$acao" in
+        relatorio) "${DCM[@]}" run --rm -T migracao relatorio --saida "/saida/relatorio-$(date +%F).md" "$@"
+                   msg "relatório em apps/migracao/saida/relatorio-$(date +%F).md" ;;
+        simular)   "${DCM[@]}" run --rm -T migracao aplicar --simular "$@" ;;
+        aplicar)   "${DCM[@]}" run --rm -T migracao aplicar "$@" ;;
+        verificar) "${DCM[@]}" run --rm -T migracao verificar "$@" ;;
+        *) erro "uso: ./provedor migrar relatorio|simular|aplicar|verificar [args]" ;;
+    esac
+}
+
+cmd_backup() {
+    exigir_root backup
+    "$APPS/backup/backup.sh" "$@"
+}
+
+cmd_virada() {
+    exigir_root virada; exigir_env
+    local acao=${1:-status}
+    case "$acao" in
+        status) "$APPS/freeradius/virada.sh" status ;;
+        ativar)
+            ativo mariadb || erro "mariadb do sistema inativo: virada cancelada."
+            [ "$(mem_livre_mb)" -ge "$MEM_MINIMA_MB" ] || erro "memória insuficiente ($(mem_livre_mb) MB): virada cancelada."
+            local bdir; bdir=$(envv BACKUP_DIR); bdir=${bdir:-/var/backups/provedor}
+            if ! ls -d "$bdir"/pre-virada-"$(date +%Y%m%d)"-* >/dev/null 2>&1; then
+                aviso "não há backup pre-virada de hoje em $bdir (recomendado: ./provedor backup pre-virada)."
+            fi
+            confirmar "VIRADA: o FreeRADIUS do sistema será PARADO e desabilitado, e o FreeRADIUS em Docker
+(authentik) passa a atender 1812/1813 com os MESMOS NAS e segredos da tabela nas (só leitura),
+gravando radacct/radpostauth. Se o teste em 1812 falhar, volta sozinho para o do sistema." VIRAR
+            "$APPS/freeradius/virada.sh" ativar ;;
+        voltar)
+            confirmar "ROLLBACK: o container freeradius para e o FreeRADIUS do sistema (daloRADIUS) é religado em 1812/1813." VOLTAR
+            "$APPS/freeradius/virada.sh" voltar ;;
+        *) erro "uso: ./provedor virada status|ativar|voltar" ;;
+    esac
+}
+
+cmd_tokens() {
+    exigir_root tokens; exigir_env
+    python3 -I "$APPS/authentik/scripts/tokens_outpost.py" --env "$ENVF" --gravar
+    chmod 600 "$ENVF"
+    msg "se radius/ldap já estavam no ar com token antigo: ./provedor restart radius / ldap"
+}
+
+# ---------------------------------------------------------------- principal
+
+cmd=${1:-ajuda}; [ $# -gt 0 ] && shift
+case "$cmd" in
+    preparar) cmd_preparar "$@" ;;
+    exemplo)  gerar_env exemplo ;;
+    up)       cmd_up "$@" ;;
+    down)     cmd_down "$@" ;;
+    restart)  cmd_restart "$@" ;;
+    logs)     cmd_logs "$@" ;;
+    ps)       cmd_ps "$@" ;;
+    config)   cmd_config "$@" ;;
+    teste)    cmd_teste "$@" ;;
+    status)   cmd_status "$@" ;;
+    migrar)   cmd_migrar "$@" ;;
+    backup)   cmd_backup "$@" ;;
+    virada)   cmd_virada "$@" ;;
+    tokens)   cmd_tokens "$@" ;;
+    ajuda|-h|--help|help) ajuda ;;
+    *) ajuda >&2; exit 2 ;;
+esac

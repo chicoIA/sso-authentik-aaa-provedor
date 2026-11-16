@@ -1,0 +1,14 @@
+# Fonte: apps/host/saude/ no git.
+[Unit]
+Description=Saúde do RADIUS da VM: retira o /32 do BGP se o FreeRADIUS parar
+After=docker.service frr.service
+
+[Service]
+# 1 = só registra o que faria (período de observação)
+Environment=PROVEDOR_SAUDE_OBSERVAR=1
+ExecStart=/usr/local/sbin/provedor-vm-saude
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

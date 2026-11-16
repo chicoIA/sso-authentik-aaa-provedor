@@ -1,0 +1,53 @@
+#!/bin/bash
+# VM: retira o anúncio do 100.66.80.196/32 se o FreeRADIUS local
+# parar de responder, e reanuncia quando voltar. Fonte: apps/host/saude/ no git.
+#
+# Sem isto, com a VM ligada e o FreeRADIUS parado, o /32 continuaria anunciado
+# e a reserva da VPS (distância 250 nas bordas) nunca seria usada.
+#
+# Retirar = "neighbor 172.16.7.9 route-map NADA out" (o frr.conf grava SAIDA:
+# depois de um reboot a VM anuncia de novo e este serviço confere).
+# Enquanto a ens192 existir, retirar o /32 não tira a VM do ar: o /26 entrega
+# o .196 pela vlan55 do BORDA-A (a VM responde ARP pela ens192).
+#
+# PROVEDOR_SAUDE_OBSERVAR=1 (no .service): só registra o que faria.
+set -uo pipefail
+CT=provedor-freeradius-freeradius-1
+INTERVALO=10
+FALHAS_RETIRA=3        # 30 s sem resposta -> retira
+OK_ANUNCIA=6           # 60 s respondendo -> anuncia de novo
+INICIO=180             # depois do boot/início: espera até 3 min o FreeRADIUS subir
+OBS=${PROVEDOR_SAUDE_OBSERVAR:-0}
+
+log() { logger -t provedor-vm-saude -- "$*"; }
+responde() {
+    timeout 8 docker exec "$CT" sh -c \
+        'printf "Message-Authenticator = 0x00\n" | radclient -r 1 -t 3 -q 127.0.0.1:${FR_PORTA_AUTH:-1812} status "$FR_SEGREDO_LOCAL"' \
+        >/dev/null 2>&1
+}
+anunciando() { vtysh -c "show running-config" 2>/dev/null | grep -q "neighbor 172.16.7.9 route-map SAIDA out"; }
+saida() {  # saida SAIDA|NADA
+    if [ "$OBS" = 1 ]; then log "OBSERVAÇÃO: trocaria a saída do BGP para $1"; return 0; fi
+    vtysh -c "conf t" -c "router bgp 65020" -c "address-family ipv4 unicast" \
+          -c "neighbor 172.16.7.9 route-map $1 out" -c "end" >/dev/null 2>&1
+}
+
+log "início (observar=$OBS, anunciando=$(anunciando && echo sim || echo não))"
+t0=$(date +%s)
+until responde || [ $(( $(date +%s) - t0 )) -ge $INICIO ]; do sleep 5; done
+# Só reanuncia o que ELE retirou: uma retirada à mão (manutenção,
+# vtysh) fica como está.
+falhas=0; oks=0; eu_retirei=0
+while sleep $INTERVALO; do
+    if responde; then
+        falhas=0; oks=$((oks + 1))
+        if [ $eu_retirei = 1 ] && [ $oks -ge $OK_ANUNCIA ]; then
+            saida SAIDA && { eu_retirei=0; log "FreeRADIUS respondendo há $((oks * INTERVALO))s: /32 anunciado"; }
+        fi
+    else
+        oks=0; falhas=$((falhas + 1))
+        if [ $eu_retirei = 0 ] && [ $falhas -ge $FALHAS_RETIRA ] && anunciando; then
+            saida NADA && { eu_retirei=1; log "FreeRADIUS sem resposta há $((falhas * INTERVALO))s: /32 RETIRADO"; }
+        fi
+    fi
+done

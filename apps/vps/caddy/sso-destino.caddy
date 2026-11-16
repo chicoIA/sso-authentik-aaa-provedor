@@ -1,0 +1,9 @@
+# Normal: authentik da VM pelo IP da /30 (não pelo .196, que existe na própria
+# VPS quando a reserva está ativa). Trocado por provedor-reserva ativa/volta.
+reverse_proxy https://172.16.7.10:9443 {
+    transport http {
+        tls_insecure_skip_verify
+    }
+    health_uri /-/health/live/
+    health_interval 15s
+}

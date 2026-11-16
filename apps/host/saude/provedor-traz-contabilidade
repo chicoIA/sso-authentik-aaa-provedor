@@ -1,0 +1,18 @@
+#!/bin/bash
+# VM: traz da VPS a contabilidade (radacct/radpostauth) gravada
+# enquanto a reserva atendeu, e grava no MariaDB da VM. Rodar depois de
+# "provedor-reserva volta" na VPS. Fonte: apps/host/saude/ no git.
+#   provedor-traz-contabilidade            lista os arquivos na VPS
+#   provedor-traz-contabilidade <arquivo>  importa (REPLACE: pode repetir)
+set -euo pipefail
+ENV=/opt/authentik-aaa-provedor/.env
+v() { grep -m1 "^$1=" "$ENV" | cut -d= -f2- | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+if [ $# -eq 0 ]; then ssh vps 'ls -l /var/lib/provedor-reserva/contabilidade-*.sql 2>/dev/null || echo "nenhum arquivo"'; exit 0; fi
+case "$1" in /var/lib/provedor-reserva/contabilidade-*.sql) ;; *) echo "arquivo inválido" >&2; exit 2 ;; esac
+TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+ssh vps "cat '$1'" > "$TMP"
+grep -q 'Dump completed' "$TMP" || { echo "arquivo incompleto" >&2; exit 3; }
+export MYSQL_PWD="$(v DALO_DB_PASS)"
+mariadb --protocol=socket --socket="$(v DALO_DB_SOCKET)" -u "$(v DALO_DB_USER)" "$(v DALO_DB_NAME)" < "$TMP"
+echo "importado: $(grep -c '^REPLACE' "$TMP") blocos de $1"
+ssh vps "mv '$1' '$1.importado'"

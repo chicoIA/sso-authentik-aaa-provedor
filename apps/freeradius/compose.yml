@@ -1,0 +1,37 @@
+# App freeradius: FreeRADIUS 3.2 em Docker na frente do authentik (herda o cadastro NAS
+# e o SQL do daloRADIUS). network_mode host: enxerga os equipamentos com o IP real e
+# fala com o outpost em 127.0.0.1:18120 e com o MariaDB do sistema pelo socket.
+# Não suba direto: use ./provedor up freeradius
+# (por usar a rede do host, este serviço não entra na rede "provedor").
+services:
+  freeradius:
+    build: .
+    image: provedor/freeradius:3.2.10
+    restart: unless-stopped
+    mem_limit: 192m
+    network_mode: host
+    environment:
+      # Mesmo fuso do host/MariaDB: o radpostauth grava a hora do FreeRADIUS (%S).
+      TZ: ${TZ:-America/Sao_Paulo}
+      # outpost RADIUS do authentik (app radius): porta presa ao loopback
+      AUTHENTIK_OUTPOST_IP: 127.0.0.1
+      OUTPOST_RADIUS_PORTA: ${OUTPOST_RADIUS_PORTA:-18120}
+      AUTHENTIK_RADIUS_SECRET: ${AUTHENTIK_RADIUS_SECRET:?defina AUTHENTIK_RADIUS_SECRET no .env}
+      FR_SEGREDO_LOCAL: ${FR_SEGREDO_LOCAL:?defina FR_SEGREDO_LOCAL no .env}
+      # 11812/11813 para testar ao lado do FreeRADIUS do sistema; 1812/1813 após a virada.
+      FR_PORTA_AUTH: ${FR_PORTA_AUTH:-11812}
+      FR_PORTA_ACCT: ${FR_PORTA_ACCT:-11813}
+      FR_CACHE_TTL: ${FR_CACHE_TTL:-300}
+      FR_CACHE_RESERVA_TTL: ${FR_CACHE_RESERVA_TTL:-1728000}
+      FR_CACHE_TRAVA_TTL: ${FR_CACHE_TRAVA_TTL:-25}
+      FR_PORTA_REVALIDA: ${FR_PORTA_REVALIDA:-18121}
+      FR_CHAP_LEGADO: ${FR_CHAP_LEGADO:-sim}
+      FR_GRAVAR_SQL: ${FR_GRAVAR_SQL:-nao}
+      FR_ACCT_IGNORAR_USUARIOS: ${FR_ACCT_IGNORAR_USUARIOS-zabbix zabbix@exemplo.net.br}
+      FR_EXIGIR_MSGAUTH: ${FR_EXIGIR_MSGAUTH:-no}
+      # banco do daloRADIUS, pelo socket /run/mysqld (usuário radius@localhost)
+      DALO_DB_USER: ${DALO_DB_USER:-radius}
+      DALO_DB_PASS: ${DALO_DB_PASS:?defina DALO_DB_PASS no .env}
+      DALO_DB_NAME: ${DALO_DB_NAME:-radius}
+    volumes:
+      - /run/mysqld:/run/mysqld:ro

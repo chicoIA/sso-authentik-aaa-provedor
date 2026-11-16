@@ -1,0 +1,9 @@
+[Unit]
+Description=Backup Exemplo (authentik, .env, apps, freeradius, radius)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/authentik-aaa-provedor/apps/backup/backup.sh completo
+Nice=19
+IOSchedulingClass=idle
